@@ -3,7 +3,7 @@ import json
 import threading
 import queue
 
-with open ("config2.json", "r") as f:
+with open ("config.json", "r") as f:
     config = json.load(f)
 
 IP = config["server_ip"]

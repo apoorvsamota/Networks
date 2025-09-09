@@ -1,103 +1,65 @@
-# import socket
-# import json
-# import argparse
-# parser = argparse.ArgumentParser()
-# parser.add_argument("--c", type = int, required = True)
-# c = parser.parse_args().c
+#!/usr/bin/env python3
+import socket, json, time, threading
 
-# with open ("config2.json", "r") as f:
-#     config = json.load(f)
+cfg = json.load(open("config.json"))
+HOST, PORT = cfg["server_ip"], int(cfg["server_port"])
+K   = int(cfg["k"])
+P0  = int(cfg.get("p", 0))
+N   = int(cfg.get("num_clients", 1))
+C   = int(cfg.get("c", 1))
 
-# IP = config["server_ip"]
-# PORT = config["server_port"]
-# k = config["k"]
-# p = config["p"]
-# filename = config["filename"]
-# iterations = config["num_iterations"]
+def one_client() -> float:
+    p = P0
+    t0 = time.perf_counter()
+    with socket.create_connection((HOST, PORT), timeout=60) as s:
+        fin = s.makefile("r", encoding="utf-8", newline="\n")
+        while True:
+            s.sendall(f"{p},{K}\n".encode())  # send one request
+            line = fin.readline()             # ... WAIT for reply
+            if not line:
+                break
+            toks = line.strip().split(",")
+            if "EOF" in toks:
+                break
+            p += K
+    return time.perf_counter() - t0
 
-# client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-# print("trying to connect to ", IP, PORT)
-# client.connect((IP, PORT))
-# mystr = f"{p},{k}\n".encode()
-# for i in range(c): client.send(mystr)
-# reply = client.recv(1024).decode().strip().split(',')
-# mydict ={}
-# for i in reply:
-#     if i not in mydict: mydict[i]=0
-#     mydict[i]+=1
-# for i in mydict.keys():
-#     print(i, mydict[i])
-# client.close()
+def greedy_client() -> float:
+    p = P0
+    t0 = time.perf_counter()
+    with socket.create_connection((HOST, PORT), timeout=60) as s:
+        fin = s.makefile("r", encoding="utf-8", newline="\n")
+        rem = True
+        while rem:
+          for _ in range(C):
+              s.sendall(f"{p},{K}\n".encode())
+              p += K
+          replies = 0
+          while replies < C:
+              line = fin.readline()             
+              if not line:
+                  rem = False
+                  break
+              toks = line.strip().split(",")
+              if "EOF" in toks:
+                  rem = False
+                  break
+              replies += 1
+          
+    return time.perf_counter() - t0
 
-import socket
-import json
-import argparse
-import time
+def worker(bar, out, i):
+    bar.wait()                 # start together
+    if i==0:
+        out[i] = greedy_client()
+    else:
+        out[i] = one_client()
 
-argument = argparse.ArgumentParser()
-argument.add_argument('--config', type=str, default='config2.json', help='Path to the JSON config file')
-# parser = argparse.ArgumentParser()
-argument.add_argument("--c", type = int, required = True)
-
-args = argument.parse_args()
-config_file = args.config
-c = args.c
-
-with open (config_file, "r") as f:
-    config = json.load(f)
-
-IP = config["server_ip"]
-PORT = config["server_port"]
-k = config["k"]
-p = config["p"]
-filename = config["filename"]
-iterations = config["num_iterations"]
-mydict ={}
-flag = False
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-client.connect((IP, PORT))
-# print("connected")
-start_time = time.time()
-# print("lmao")
-while (not flag):
-    # print("trying to connect to ", IP, PORT)
-    for _ in range(c):
-        mystr = f"{p},{k}\n".encode()
-        client.send(mystr)
-        p+=k
-        # time.sleep(0.001)
-    # print("sent, ", mystr)
-    print("sent and waiting now", int(1000*(time.time()-start_time)))
-    replies =0
-    buffer =""
-    while(replies<c):
-        replyall = client.recv(1024).decode()
-        buffer += replyall
-        print(buffer, int(1000*(time.time()-start_time)))
-
-        while("\n" in buffer):
-            reply, buffer = buffer.split('\n', 1)
-            final = reply.split(',')
-            for i in final:
-                if i=="EOF":
-                    flag = True
-                    continue
-                if i not in mydict: mydict[i]=0
-                mydict[i]+=1
-            replies+=1
-            # if not flag:
-            #     mystr = f"{p},{k}\n".encode()
-            #     client.send(mystr)
-            #     p+=k
-            #     replies-=1
-    
-
-client.close()
-
-
-for i in mydict.keys():
-    print(i, mydict[i])
-print("ELAPSED_MS:", int(1000*(time.time()-start_time)))
-
+if __name__ == "__main__":
+    times = [0.0]*N
+    barrier = threading.Barrier(N)
+    ts = [threading.Thread(target=worker, args=(barrier, times, i)) for i in range(N)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    print(",".join(f"{x:.6f}" for x in times))
 
