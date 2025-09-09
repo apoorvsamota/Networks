@@ -11,7 +11,7 @@ GREEDY_IDX  = int(cfg.get("greedy_index", 0))
 ITERATIONS  = int(cfg.get("num_iterations", 5))
 
 C_START     = int(cfg.get("c_start", 1))
-C_MAX       = int(cfg.get("c_max", 80))
+C_MAX       = int(cfg.get("c_max", 20))
 C_STEP      = int(cfg.get("c_step", 4))
 
 HOST        = cfg.get("server_ip", "10.0.0.2")

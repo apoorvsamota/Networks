@@ -1,0 +1,10 @@
+{
+  "server_ip": "10.0.0.2",
+  "server_port": 5000,
+  "k": 20,
+  "p": 0,
+  "filename": "words.txt",
+  "num_iterations": 5,
+  "num_clients": 10,
+  "c": 1
+}
