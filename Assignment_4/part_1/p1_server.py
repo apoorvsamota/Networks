@@ -14,9 +14,11 @@ import os
 MSS = 1180  # Maximum segment size for data (1200 - 20 header)
 HEADER_SIZE = 20
 MAX_PAYLOAD = 1200
-INITIAL_RTO = 0.5  # Initial retransmission timeout in seconds
+INITIAL_RTO = 0.2  # Initial retransmission timeout in seconds (reduced for faster recovery)
 ALPHA = 0.125  # For RTT estimation
 BETA = 0.25   # For RTT deviation estimation
+MIN_RTO = 0.1  # Minimum RTO (faster loss detection)
+MAX_RTO = 1.5  # Maximum RTO (prevent excessive waiting)
 
 class ReliableUDPServer:
     def __init__(self, ip, port, sws):
@@ -64,7 +66,7 @@ class ReliableUDPServer:
             self.estimated_rtt = (1 - ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
         
         self.RTO = self.estimated_rtt + 4 * self.dev_rtt
-        self.RTO = max(0.2, min(2.0, self.RTO))  # Clamp between 200ms and 2s
+        self.RTO = max(MIN_RTO, min(MAX_RTO, self.RTO))  # Clamp between 100ms and 1.5s
     
     def send_file(self, client_addr, filename):
         """Send file using reliable UDP with sliding window protocol"""
@@ -180,8 +182,8 @@ class ReliableUDPServer:
                     # Duplicate ACK
                     self.dup_ack_count += 1
                     
-                    # Fast retransmit after 3 duplicate ACKs
-                    if self.dup_ack_count == 3:
+                    # Fast retransmit after 2 duplicate ACKs (more aggressive for high loss)
+                    if self.dup_ack_count == 2:
                         print(f"[SERVER] Fast retransmit: seq {self.packets[self.base][0]}")
                         seq_num, packet, data_len = self.packets[self.base]
                         self.sock.sendto(packet, client_addr)
@@ -204,8 +206,8 @@ class ReliableUDPServer:
                 
                 # Restart timer
                 self.timer_start = time.time()
-                # Double RTO on timeout (exponential backoff)
-                self.RTO = min(self.RTO * 2, 2.0)
+                # Moderate RTO growth on timeout (1.5x instead of 2x for faster recovery)
+                self.RTO = min(self.RTO * 1.5, MAX_RTO)
         
         end_time = time.time()
         duration = end_time - start_time
