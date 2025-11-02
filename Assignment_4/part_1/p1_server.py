@@ -14,10 +14,10 @@ import os
 MSS = 1180  # Maximum segment size for data (1200 - 20 header)
 HEADER_SIZE = 20
 MAX_PAYLOAD = 1200
-INITIAL_RTO = 0.25  # More aggressive initial RTO
+INITIAL_RTO = 0.3  # Balanced initial RTO (not too aggressive)
 ALPHA = 0.125  # For RTT estimation
 BETA = 0.25   # For RTT deviation estimation
-MIN_RTO = 0.1  # More aggressive minimum
+MIN_RTO = 0.15  # Balanced minimum (was too aggressive at 0.1)
 MAX_RTO = 2.0  # Allow higher max for very lossy networks
 
 class ReliableUDPServer:
@@ -120,14 +120,20 @@ class ReliableUDPServer:
                         break
         
         if timed_out_seqs:
+            # Limit burst size at high loss to prevent overwhelming network
+            max_retransmit_burst = 5
+            timed_out_seqs = timed_out_seqs[:max_retransmit_burst]
+            
             print(f"[SERVER] TIMEOUT! Retransmitting {len(timed_out_seqs)} packet(s)")
             for idx, seq_num, packet in timed_out_seqs:
                 self.sock.sendto(packet, client_addr)
                 self.packet_timers[seq_num] = time.time()
                 self.retransmissions += 1
+                # Small delay between retransmissions to avoid burst
+                time.sleep(0.001)
             
-            # Mild backoff on timeout
-            self.RTO = min(self.RTO * 1.5, MAX_RTO)
+            # Conservative backoff on timeout (important for high loss)
+            self.RTO = min(self.RTO * 2.0, MAX_RTO)
     
     def send_file(self, client_addr, filename):
         """Send file using reliable UDP with SACK and per-packet timeouts"""

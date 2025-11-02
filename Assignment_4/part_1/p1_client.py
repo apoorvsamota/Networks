@@ -145,7 +145,7 @@ class ReliableUDPClient:
         self.send_ack(self.expected_seq)
         
         # Set balanced timeout for data reception
-        self.sock.settimeout(1.5)
+        self.sock.settimeout(2.0)
         
         # Receive remaining packets
         eof_received = False
