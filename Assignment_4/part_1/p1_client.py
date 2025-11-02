@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Part 1 Client: Reliable UDP File Transfer
-Receives file from server, sends cumulative ACKs, handles out-of-order packets
+Part 1 Client: Reliable UDP File Transfer (IMPROVED)
+Receives file from server with SACK support for better performance under loss
 """
 
 import socket
@@ -30,6 +30,7 @@ class ReliableUDPClient:
         # Statistics
         self.packets_received = 0
         self.acks_sent = 0
+        self.out_of_order_packets = 0
         
     def parse_packet(self, packet):
         """Parse packet header and extract data"""
@@ -40,10 +41,51 @@ class ReliableUDPClient:
         data = packet[HEADER_SIZE:]  # Skip 20-byte header
         return seq_num, data
     
+    def build_sack_blocks(self):
+        """Build SACK blocks from buffered out-of-order packets"""
+        if not self.buffer:
+            return []
+        
+        # Sort buffered sequence numbers
+        sorted_seqs = sorted(self.buffer.keys())
+        sack_blocks = []
+        
+        # Find contiguous blocks of buffered data
+        block_start = sorted_seqs[0]
+        block_end = block_start + len(self.buffer[block_start])
+        
+        for seq in sorted_seqs[1:]:
+            if seq == block_end:
+                # Extend current block
+                block_end = seq + len(self.buffer[seq])
+            else:
+                # Save current block and start new one
+                sack_blocks.append((block_start, block_end))
+                block_start = seq
+                block_end = seq + len(self.buffer[seq])
+        
+        # Add the last block
+        sack_blocks.append((block_start, block_end))
+        
+        # Return up to 2 SACK blocks (fits in 16 reserved bytes)
+        return sack_blocks[:2]
+    
     def send_ack(self, ack_num):
-        """Send cumulative ACK packet"""
-        # ACK packet: 4 bytes for ACK number + 16 bytes reserved
-        ack_packet = struct.pack('!I', ack_num) + b'\x00' * 16
+        """Send cumulative ACK with SACK blocks for out-of-order packets"""
+        # Start with 4-byte ACK number
+        ack_packet = struct.pack('!I', ack_num)
+        
+        # Add SACK blocks in the 16 reserved bytes
+        # Each block is 8 bytes (2 x 4-byte integers: left_edge, right_edge)
+        sack_blocks = self.build_sack_blocks()
+        
+        for left, right in sack_blocks:
+            ack_packet += struct.pack('!II', left, right)
+        
+        # Pad to exactly 20 bytes
+        while len(ack_packet) < 20:
+            ack_packet += b'\x00'
+        
         self.sock.sendto(ack_packet, (self.server_ip, self.server_port))
         self.acks_sent += 1
     
@@ -69,7 +111,7 @@ class ReliableUDPClient:
         return None
     
     def receive_file(self, output_filename='received_data.txt'):
-        """Receive file from server using reliable UDP"""
+        """Receive file from server using reliable UDP with SACK"""
         print(f"[CLIENT] Connecting to server {self.server_ip}:{self.server_port}")
         
         # Request file and get first packet
@@ -77,7 +119,7 @@ class ReliableUDPClient:
         if not first_packet:
             return False
         
-        print(f"[CLIENT] Starting file transfer...")
+        print(f"[CLIENT] Starting file transfer with SACK support...")
         start_time = time.time()
         last_print = start_time
         overall_timeout = 300  # 5 minutes max for entire transfer
@@ -103,7 +145,7 @@ class ReliableUDPClient:
         self.send_ack(self.expected_seq)
         
         # Set balanced timeout for data reception
-        self.sock.settimeout(2.0)
+        self.sock.settimeout(1.5)
         
         # Receive remaining packets
         eof_received = False
@@ -138,21 +180,22 @@ class ReliableUDPClient:
                     self.file_data.extend(data)
                     self.expected_seq += len(data)
                     
-                    # Check buffer for consecutive packets
+                    # Process buffered packets that are now in order
                     while self.expected_seq in self.buffer:
                         buffered_data = self.buffer.pop(self.expected_seq)
                         self.file_data.extend(buffered_data)
                         self.expected_seq += len(buffered_data)
                     
-                    # Send cumulative ACK
+                    # Send cumulative ACK with SACK info
                     self.send_ack(self.expected_seq)
                     
                 elif seq_num > self.expected_seq:
                     # Out-of-order packet - buffer it
                     if seq_num not in self.buffer:
                         self.buffer[seq_num] = data
+                        self.out_of_order_packets += 1
                     
-                    # Send duplicate ACK for expected sequence
+                    # Send ACK with SACK blocks telling server we have this packet
                     self.send_ack(self.expected_seq)
                     
                 else:
@@ -164,7 +207,8 @@ class ReliableUDPClient:
                     print(f"[CLIENT] Received: {len(self.file_data)} bytes | "
                           f"Packets: {self.packets_received} | "
                           f"ACKs sent: {self.acks_sent} | "
-                          f"Buffered: {len(self.buffer)}")
+                          f"Buffered: {len(self.buffer)} | "
+                          f"Out-of-order: {self.out_of_order_packets}")
                     last_print = time.time()
                     
             except socket.timeout:
@@ -197,6 +241,7 @@ class ReliableUDPClient:
         print(f"[CLIENT] Bytes received: {len(self.file_data)}")
         print(f"[CLIENT] Packets received: {self.packets_received}")
         print(f"[CLIENT] ACKs sent: {self.acks_sent}")
+        print(f"[CLIENT] Out-of-order packets: {self.out_of_order_packets}")
         print(f"[CLIENT] Average throughput: {len(self.file_data) / duration / 1024:.2f} KB/s")
         
         return True
