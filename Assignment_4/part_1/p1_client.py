@@ -102,8 +102,8 @@ class ReliableUDPClient:
         self.packets_received += 1
         self.send_ack(self.expected_seq)
         
-        # Set optimized timeout for data reception
-        self.sock.settimeout(1.0)
+        # Set balanced timeout for data reception
+        self.sock.settimeout(2.0)
         
         # Receive remaining packets
         eof_received = False
@@ -175,8 +175,8 @@ class ReliableUDPClient:
                 self.send_ack(self.expected_seq)
                 
                 # If we've had too many consecutive timeouts, give up
-                if consecutive_timeouts > 30:
-                    print("[ERROR] Too many consecutive timeouts (30) - transfer failed!")
+                if consecutive_timeouts > 25:
+                    print("[ERROR] Too many consecutive timeouts (25) - transfer failed!")
                     print(f"[ERROR] Expected seq: {self.expected_seq}, Received: {len(self.file_data)} bytes")
                     return False
         

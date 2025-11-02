@@ -14,11 +14,11 @@ import os
 MSS = 1180  # Maximum segment size for data (1200 - 20 header)
 HEADER_SIZE = 20
 MAX_PAYLOAD = 1200
-INITIAL_RTO = 0.2  # Initial retransmission timeout in seconds (reduced for faster recovery)
+INITIAL_RTO = 0.3  # Initial retransmission timeout in seconds (balanced)
 ALPHA = 0.125  # For RTT estimation
 BETA = 0.25   # For RTT deviation estimation
-MIN_RTO = 0.1  # Minimum RTO (faster loss detection)
-MAX_RTO = 1.5  # Maximum RTO (prevent excessive waiting)
+MIN_RTO = 0.15  # Minimum RTO (not too aggressive)
+MAX_RTO = 1.0  # Maximum RTO (faster than 2s but not too fast)
 
 class ReliableUDPServer:
     def __init__(self, ip, port, sws):
@@ -65,8 +65,8 @@ class ReliableUDPServer:
             self.dev_rtt = (1 - BETA) * self.dev_rtt + BETA * abs(sample_rtt - self.estimated_rtt)
             self.estimated_rtt = (1 - ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
         
-        self.RTO = self.estimated_rtt + 4 * self.dev_rtt
-        self.RTO = max(MIN_RTO, min(MAX_RTO, self.RTO))  # Clamp between 100ms and 1.5s
+        self.RTO = self.estimated_rtt + 3 * self.dev_rtt
+        self.RTO = max(MIN_RTO, min(MAX_RTO, self.RTO))  # Clamp between 150ms and 1.0s
     
     def send_file(self, client_addr, filename):
         """Send file using reliable UDP with sliding window protocol"""
@@ -182,8 +182,8 @@ class ReliableUDPServer:
                     # Duplicate ACK
                     self.dup_ack_count += 1
                     
-                    # Fast retransmit after 2 duplicate ACKs (more aggressive for high loss)
-                    if self.dup_ack_count == 2:
+                    # Fast retransmit after 3 duplicate ACKs (standard TCP behavior)
+                    if self.dup_ack_count == 3:
                         print(f"[SERVER] Fast retransmit: seq {self.packets[self.base][0]}")
                         seq_num, packet, data_len = self.packets[self.base]
                         self.sock.sendto(packet, client_addr)
@@ -196,18 +196,17 @@ class ReliableUDPServer:
             
             # Check for timeout
             if self.timer_start and (time.time() - self.timer_start) > self.RTO:
-                print(f"[SERVER] Timeout! Retransmitting from seq {self.packets[self.base][0]}")
+                print(f"[SERVER] Timeout! Retransmitting seq {self.packets[self.base][0]}")
                 
-                # Retransmit all packets in window
-                for i in range(self.base, min(self.next_seq_num, len(self.packets))):
-                    seq_num, packet, data_len = self.packets[i]
-                    self.sock.sendto(packet, client_addr)
-                    self.retransmissions += 1
+                # Only retransmit the base packet (more efficient than retransmitting entire window)
+                seq_num, packet, data_len = self.packets[self.base]
+                self.sock.sendto(packet, client_addr)
+                self.retransmissions += 1
                 
                 # Restart timer
                 self.timer_start = time.time()
-                # Moderate RTO growth on timeout (1.5x instead of 2x for faster recovery)
-                self.RTO = min(self.RTO * 1.5, MAX_RTO)
+                # Balanced RTO growth on timeout (1.75x for good recovery without congestion)
+                self.RTO = min(self.RTO * 1.75, MAX_RTO)
         
         end_time = time.time()
         duration = end_time - start_time
