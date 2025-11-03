@@ -129,10 +129,19 @@ class ReliableUDPClient:
                 f.write(b'')
             return True
         
-        self.file_data.extend(data)
-        self.expected_seq = len(data)
-        self.pkts_recv += 1
-        self.send_ack(self.expected_seq)
+        # CRITICAL: First packet MUST be seq=0, otherwise buffer it
+        if seq == 0:
+            self.file_data.extend(data)
+            self.expected_seq = len(data)
+            self.pkts_recv += 1
+            self.send_ack(self.expected_seq)
+        else:
+            # First packet is out of order! Buffer it and wait for seq=0
+            print(f"[CLIENT] First packet out of order (seq={seq}), buffering")
+            self.buffer[seq] = data
+            self.ooo_count += 1
+            self.pkts_recv += 1
+            self.send_ack(0)  # Still expecting seq=0
         
         # NO timeout - blocking receive
         self.sock.settimeout(None)

@@ -112,12 +112,12 @@ class ReliableUDPServer:
             self.rto = min(self.rto * 1.3, MAX_RTO)
     
     def slide_window(self, all_lens):
-        while self.base in self.acked:
+        while self.base in self.acked and self.base in all_lens:
             self.acked.remove(self.base)
             self.packets.pop(self.base, None)
             self.send_times.pop(self.base, None)
             self.timeouts.pop(self.base, None)
-            pkt_len = all_lens.get(self.base, MSS)
+            pkt_len = all_lens[self.base]
             self.base += pkt_len
     
     def send_file(self, addr, fname):
@@ -166,24 +166,36 @@ class ReliableUDPServer:
         
         # Main loop
         while self.base < file_size:
+            # Safety check: base should always be a valid packet boundary
+            if self.base not in all_lens:
+                print(f"[ERROR] Invalid base position: {self.base}")
+                print(f"[ERROR] This indicates a bug in window management")
+                break
+            
             # Send packets
             while self.next_seq < file_size:
                 bytes_in_flight = self.next_seq - self.base
                 if bytes_in_flight >= self.sws:
                     break
                 
-                if self.next_seq not in self.acked and self.next_seq in all_pkts:
-                    pkt = all_pkts[self.next_seq]
-                    self.sock.sendto(pkt, addr)
-                    self.packets[self.next_seq] = pkt
-                    self.sent += 1
+                # Only send if this is a valid packet boundary
+                if self.next_seq in all_pkts:
+                    if self.next_seq not in self.acked:
+                        pkt = all_pkts[self.next_seq]
+                        self.sock.sendto(pkt, addr)
+                        self.packets[self.next_seq] = pkt
+                        self.sent += 1
+                        
+                        now = time.time()
+                        self.send_times[self.next_seq] = now
+                        self.timeouts[self.next_seq] = now + self.rto
                     
-                    now = time.time()
-                    self.send_times[self.next_seq] = now
-                    self.timeouts[self.next_seq] = now + self.rto
-                
-                pkt_len = all_lens.get(self.next_seq, MSS)
-                self.next_seq += pkt_len
+                    # Advance by actual packet length
+                    self.next_seq += all_lens[self.next_seq]
+                else:
+                    # Should never happen, but safety check
+                    print(f"[ERROR] Invalid next_seq: {self.next_seq}")
+                    break
             
             # Wait for ACK
             timeout = self.get_timeout()
@@ -197,16 +209,20 @@ class ReliableUDPServer:
                 if ack_num is None:
                     continue
                 
-                # Cumulative ACK
+                # Cumulative ACK - only mark actual packet boundaries as acked
                 if ack_num > self.base:
                     s = self.base
                     while s < ack_num and s < file_size:
-                        if s not in self.acked:
-                            self.acked.add(s)
-                            if s == self.base and s in self.send_times:
-                                sample = recv_time - self.send_times[s]
-                                self.update_rto(sample)
-                        s += all_lens.get(s, MSS)
+                        if s in all_lens:  # Only process if valid packet boundary
+                            if s not in self.acked:
+                                self.acked.add(s)
+                                if s == self.base and s in self.send_times:
+                                    sample = recv_time - self.send_times[s]
+                                    self.update_rto(sample)
+                            s += all_lens[s]
+                        else:
+                            # Skip to next possible packet boundary
+                            s += MSS
                     
                     self.slide_window(all_lens)
                     self.dup_acks.clear()
@@ -218,13 +234,17 @@ class ReliableUDPServer:
                               f"Retrans: {self.retrans} | RTO: {self.rto:.3f}s")
                         last_print = time.time()
                 
-                # SACKs
+                # SACKs - must check if s is actually a valid packet sequence
                 for l, r in sacks:
                     s = l
                     while s < r and s < file_size:
-                        if s >= self.base and s not in self.acked:
+                        # Only mark as acked if this is actually a packet boundary
+                        if s in all_lens and s >= self.base and s not in self.acked:
                             self.acked.add(s)
-                        s += all_lens.get(s, MSS)
+                            s += all_lens[s]
+                        else:
+                            # Not a valid packet boundary, skip ahead
+                            s += MSS
                 
                 # Fast retransmit
                 if ack_num == last_ack_base:
