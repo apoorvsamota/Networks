@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Part 1 Server: Reliable UDP File Transfer
-Optimized for speed with SACK support
+High-performance dictionary-based implementation
 """
 
 import socket
@@ -10,330 +10,265 @@ import time
 import struct
 import os
 
-# Constants - optimized for speed like bihari's code
-MSS = 1180  # Maximum segment size for data (1200 - 20 header)
+# Constants - Aggressive for speed
+MSS = 1180
 HEADER_SIZE = 20
 MAX_PAYLOAD = 1200
-INITIAL_RTO = 0.25  # Reduced from 0.3 for faster start
-ALPHA = 0.125  # For RTT estimation
-BETA = 0.25   # For RTT deviation estimation
-MIN_RTO = 0.1  # Reduced from 0.15 for faster retransmission
-MAX_RTO = 2.0  # Increased from 1.0 for better stability
+INITIAL_RTO = 0.2
+ALPHA = 0.125
+BETA = 0.25
+MIN_RTO = 0.08
+MAX_RTO = 1.5
 
 class ReliableUDPServer:
     def __init__(self, ip, port, sws):
         self.ip = ip
         self.port = port
-        self.sws = sws  # Sender window size in bytes
+        self.sws = sws
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((ip, port))
-        self.sock.settimeout(0.1)  # Short timeout for non-blocking receive
         
-        # Sliding window state
-        self.base = 0  # Sequence number of oldest unacked byte
-        self.next_seq_num = 0  # Next sequence number to send
-        self.packets = []  # List of (seq_num, packet_data, data_len) tuples
+        # Window state
+        self.base = 0
+        self.next_seq = 0
         
-        # Per-packet tracking for selective repeat
-        self.acked_seqs = set()  # Track individually acknowledged sequence numbers
-        self.packet_send_times = {}  # seq_num -> send_time for RTT calculation
-        self.packet_timeouts = {}  # seq_num -> timeout_time for per-packet timeouts
+        # Dictionary-based storage (O(1) access)
+        self.packets = {}
+        self.pkt_lens = {}
+        self.send_times = {}
+        self.timeouts = {}
+        self.acked = set()
         
-        # Timeout management
-        self.timer_start = None
-        self.estimated_rtt = INITIAL_RTO
+        # RTO
+        self.est_rtt = None
         self.dev_rtt = 0
-        self.RTO = INITIAL_RTO
+        self.rto = INITIAL_RTO
         
         # Fast retransmit
-        self.dup_ack_count = {}  # Track duplicate ACKs per ack_num
-        self.last_ack = 0
+        self.dup_acks = {}
         
-        # Statistics
-        self.packets_sent = 0
-        self.retransmissions = 0
-        self.fast_retransmits = 0
+        # Stats
+        self.sent = 0
+        self.retrans = 0
+        self.fast_retrans = 0
         
-    def make_packet(self, seq_num, data):
-        """Create a packet with header (20 bytes) and data"""
-        # 4 bytes: sequence number
-        # 16 bytes: reserved (can be used for SACK, timestamps, etc.)
-        header = struct.pack('!I', seq_num)
-        header += b'\x00' * 16  # Reserved bytes
-        return header + data
+    def make_pkt(self, seq, data):
+        hdr = struct.pack('!I', seq) + b'\x00' * 16
+        return hdr + data
     
-    def parse_ack_packet(self, ack_packet):
-        """Parse ACK packet including SACK blocks"""
-        if len(ack_packet) < 4:
+    def parse_ack(self, pkt):
+        if len(pkt) < 4:
             return None, []
         
-        # Extract cumulative ACK
-        ack_num = struct.unpack('!I', ack_packet[:4])[0]
+        ack = struct.unpack('!I', pkt[:4])[0]
+        sacks = []
         
-        # Extract SACK blocks if present
-        sack_blocks = []
-        if len(ack_packet) >= 20:
+        if len(pkt) >= 20:
             try:
-                # Parse up to 2 SACK blocks (8 bytes each)
                 for i in range(2):
-                    offset = 4 + i * 8
-                    if offset + 8 <= len(ack_packet):
-                        start = struct.unpack('!I', ack_packet[offset:offset+4])[0]
-                        end = struct.unpack('!I', ack_packet[offset+4:offset+8])[0]
-                        if start > 0 and end > start:
-                            sack_blocks.append((start, end))
+                    off = 4 + i * 8
+                    if off + 8 <= len(pkt):
+                        l = struct.unpack('!I', pkt[off:off+4])[0]
+                        r = struct.unpack('!I', pkt[off+4:off+8])[0]
+                        if l > 0 and r > l:
+                            sacks.append((l, r))
             except:
-                pass  # Ignore malformed SACK blocks
+                pass
         
-        return ack_num, sack_blocks
+        return ack, sacks
     
-    def update_rto(self, sample_rtt):
-        """Update RTO using exponential weighted moving average"""
-        if self.estimated_rtt == INITIAL_RTO:
-            self.estimated_rtt = sample_rtt
-            self.dev_rtt = sample_rtt / 2
+    def update_rto(self, sample):
+        if self.est_rtt is None:
+            self.est_rtt = sample
+            self.dev_rtt = sample / 2
         else:
-            self.dev_rtt = (1 - BETA) * self.dev_rtt + BETA * abs(sample_rtt - self.estimated_rtt)
-            self.estimated_rtt = (1 - ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
+            self.dev_rtt = (1 - BETA) * self.dev_rtt + BETA * abs(sample - self.est_rtt)
+            self.est_rtt = (1 - ALPHA) * self.est_rtt + ALPHA * sample
         
-        self.RTO = self.estimated_rtt + 3 * self.dev_rtt
-        self.RTO = max(MIN_RTO, min(MAX_RTO, self.RTO))  # Clamp
+        self.rto = self.est_rtt + 2.5 * self.dev_rtt
+        self.rto = max(MIN_RTO, min(MAX_RTO, self.rto))
     
-    def get_dynamic_timeout(self):
-        """Get earliest packet timeout for dynamic waiting"""
-        if not self.packet_timeouts:
-            return self.RTO
+    def get_timeout(self):
+        if not self.timeouts:
+            return self.rto
         
-        current_time = time.time()
-        min_timeout = min(self.packet_timeouts.values())
-        return max(0.01, min_timeout - current_time)
+        now = time.time()
+        earliest = min(self.timeouts.values())
+        return max(0.005, earliest - now)
     
-    def check_packet_timeouts(self, client_addr):
-        """Check for timed out packets and retransmit them"""
-        current_time = time.time()
-        timed_out_indices = []
+    def check_timeouts(self, addr):
+        now = time.time()
+        timed_out = [seq for seq, t in self.timeouts.items() 
+                     if seq not in self.acked and now >= t]
         
-        # Find timed out packets
-        for idx, (seq_num, packet, data_len) in enumerate(self.packets):
-            if idx < self.base:
-                continue  # Skip already acknowledged
-            if seq_num in self.acked_seqs:
-                continue  # Skip SACK'd packets
-            if seq_num in self.packet_timeouts and current_time >= self.packet_timeouts[seq_num]:
-                timed_out_indices.append(idx)
-        
-        if timed_out_indices:
-            print(f"[SERVER] Timeout! Retransmitting {len(timed_out_indices)} packet(s)")
-            for idx in timed_out_indices:
-                seq_num, packet, data_len = self.packets[idx]
-                self.sock.sendto(packet, client_addr)
-                self.retransmissions += 1
-                # Update timeout
-                self.packet_timeouts[seq_num] = time.time() + self.RTO
-                self.packet_send_times[seq_num] = time.time()
+        if timed_out:
+            for seq in timed_out:
+                if seq in self.packets:
+                    self.sock.sendto(self.packets[seq], addr)
+                    self.retrans += 1
+                    self.send_times[seq] = now
+                    self.timeouts[seq] = now + self.rto
             
-            # Backoff RTO (less aggressive than before)
-            self.RTO = min(self.RTO * 1.5, MAX_RTO)
+            self.rto = min(self.rto * 1.3, MAX_RTO)
     
-    def send_file(self, client_addr, filename):
-        """Send file using reliable UDP with sliding window protocol"""
-        print(f"[SERVER] Sending file '{filename}' to {client_addr}")
-        print(f"[SERVER] Sender window size: {self.sws} bytes")
+    def slide_window(self, all_lens):
+        while self.base in self.acked:
+            self.acked.remove(self.base)
+            self.packets.pop(self.base, None)
+            self.send_times.pop(self.base, None)
+            self.timeouts.pop(self.base, None)
+            pkt_len = all_lens.get(self.base, MSS)
+            self.base += pkt_len
+    
+    def send_file(self, addr, fname):
+        print(f"[SERVER] Sending '{fname}' to {addr}")
+        print(f"[SERVER] Window: {self.sws} bytes")
         
-        # Read file
         try:
-            with open(filename, 'rb') as f:
-                file_data = f.read()
+            with open(fname, 'rb') as f:
+                data = f.read()
         except FileNotFoundError:
-            print(f"[ERROR] File '{filename}' not found")
+            print(f"[ERROR] File not found")
             return
         
-        print(f"[SERVER] File size: {len(file_data)} bytes")
+        file_size = len(data)
+        print(f"[SERVER] Size: {file_size} bytes")
         
-        # Split data into packets
-        self.packets = []
-        seq_num = 0
-        packet_count = 0
+        # Prepare packets
+        all_pkts = {}
+        all_lens = {}
+        seq = 0
         
-        for i in range(0, len(file_data), MSS):
-            chunk = file_data[i:i+MSS]
-            packet = self.make_packet(seq_num, chunk)
-            self.packets.append((seq_num, packet, len(chunk)))
-            seq_num += len(chunk)
-            packet_count += 1
+        for i in range(0, file_size, MSS):
+            chunk = data[i:i+MSS]
+            pkt = self.make_pkt(seq, chunk)
+            all_pkts[seq] = pkt
+            all_lens[seq] = len(chunk)
+            seq += len(chunk)
         
-        # Add EOF packet
-        eof_packet = self.make_packet(seq_num, b'EOF')
-        self.packets.append((seq_num, eof_packet, 3))
+        print(f"[SERVER] Packets: {len(all_pkts)}")
         
-        print(f"[SERVER] Split into {packet_count} data packets + 1 EOF packet")
-        print(f"[SERVER] Starting transmission...")
-        
-        # Initialize state
+        # Reset
         self.base = 0
-        self.next_seq_num = 0
-        self.timer_start = None
-        self.dup_ack_count = {}
-        self.last_ack = 0
-        self.packets_sent = 0
-        self.retransmissions = 0
-        self.fast_retransmits = 0
-        self.acked_seqs = set()
-        self.packet_send_times = {}
-        self.packet_timeouts = {}
+        self.next_seq = 0
+        self.packets = {}
+        self.send_times = {}
+        self.timeouts = {}
+        self.acked = set()
+        self.dup_acks = {}
+        self.sent = 0
+        self.retrans = 0
+        self.fast_retrans = 0
         
-        start_time = time.time()
-        last_print = start_time
+        start = time.time()
+        last_print = start
+        last_ack_base = 0
         
-        # Main sending loop
-        while self.base < len(self.packets):
-            # Send new packets within window
-            while self.next_seq_num < len(self.packets):
-                # Calculate bytes in flight
-                if self.next_seq_num > 0:
-                    bytes_in_flight = self.packets[self.next_seq_num - 1][0] + \
-                                    self.packets[self.next_seq_num - 1][2] - \
-                                    self.packets[self.base][0]
-                else:
-                    bytes_in_flight = 0
-                
-                # Check if we can send more
+        # Main loop
+        while self.base < file_size:
+            # Send packets
+            while self.next_seq < file_size:
+                bytes_in_flight = self.next_seq - self.base
                 if bytes_in_flight >= self.sws:
                     break
                 
-                # Send packet
-                seq_num, packet, data_len = self.packets[self.next_seq_num]
-                
-                # Only send if not already SACK'd
-                if seq_num not in self.acked_seqs:
-                    self.sock.sendto(packet, client_addr)
-                    self.packets_sent += 1
+                if self.next_seq not in self.acked and self.next_seq in all_pkts:
+                    pkt = all_pkts[self.next_seq]
+                    self.sock.sendto(pkt, addr)
+                    self.packets[self.next_seq] = pkt
+                    self.sent += 1
                     
-                    # Track send time and timeout
-                    current_time = time.time()
-                    self.packet_send_times[seq_num] = current_time
-                    self.packet_timeouts[seq_num] = current_time + self.RTO
+                    now = time.time()
+                    self.send_times[self.next_seq] = now
+                    self.timeouts[self.next_seq] = now + self.rto
                 
-                # Start timer for first unacked packet
-                if self.base == self.next_seq_num:
-                    self.timer_start = time.time()
-                
-                self.next_seq_num += 1
+                pkt_len = all_lens.get(self.next_seq, MSS)
+                self.next_seq += pkt_len
             
-            # Try to receive ACK with dynamic timeout
-            timeout = self.get_dynamic_timeout()
+            # Wait for ACK
+            timeout = self.get_timeout()
             self.sock.settimeout(timeout)
             
             try:
-                ack_packet, addr = self.sock.recvfrom(1024)
-                receive_time = time.time()
-                ack_num, sack_blocks = self.parse_ack_packet(ack_packet)
+                ack_pkt, _ = self.sock.recvfrom(1024)
+                recv_time = time.time()
+                ack_num, sacks = self.parse_ack(ack_pkt)
                 
                 if ack_num is None:
                     continue
                 
-                # Calculate RTT sample if this ACKs our base
-                if self.timer_start and ack_num > self.packets[self.base][0]:
-                    sample_rtt = receive_time - self.timer_start
-                    self.update_rto(sample_rtt)
-                
-                # Process cumulative ACK
-                if ack_num > self.packets[self.base][0]:
-                    # New ACK - move window forward
-                    old_base = self.base
-                    while self.base < len(self.packets) and \
-                          (self.packets[self.base][0] + self.packets[self.base][2]) <= ack_num:
-                        # Clean up acknowledged packet
-                        seq = self.packets[self.base][0]
-                        self.acked_seqs.discard(seq)
-                        self.packet_send_times.pop(seq, None)
-                        self.packet_timeouts.pop(seq, None)
-                        self.base += 1
+                # Cumulative ACK
+                if ack_num > self.base:
+                    s = self.base
+                    while s < ack_num and s < file_size:
+                        if s not in self.acked:
+                            self.acked.add(s)
+                            if s == self.base and s in self.send_times:
+                                sample = recv_time - self.send_times[s]
+                                self.update_rto(sample)
+                        s += all_lens.get(s, MSS)
                     
-                    # Reset duplicate ACK counter
-                    self.dup_ack_count.clear()
-                    self.last_ack = ack_num
+                    self.slide_window(all_lens)
+                    self.dup_acks.clear()
+                    last_ack_base = ack_num
                     
-                    # Restart timer for new base
-                    if self.base < len(self.packets):
-                        self.timer_start = time.time()
-                    else:
-                        self.timer_start = None
-                    
-                    # Progress update
                     if time.time() - last_print > 1.0:
-                        progress = (self.base / len(self.packets)) * 100
-                        print(f"[SERVER] Progress: {progress:.1f}% | "
-                              f"Sent: {self.packets_sent} | "
-                              f"Retrans: {self.retransmissions} | "
-                              f"RTO: {self.RTO:.3f}s")
+                        prog = (self.base / file_size) * 100
+                        print(f"[SERVER] {prog:.1f}% | Sent: {self.sent} | "
+                              f"Retrans: {self.retrans} | RTO: {self.rto:.3f}s")
                         last_print = time.time()
                 
-                # Process SACK blocks - mark selectively acknowledged packets
-                for sack_start, sack_end in sack_blocks:
-                    for idx in range(self.base, len(self.packets)):
-                        seq_num, _, data_len = self.packets[idx]
-                        seq_end = seq_num + data_len
-                        
-                        # Check if packet is within SACK range
-                        if seq_num >= sack_start and seq_end <= sack_end:
-                            if seq_num not in self.acked_seqs:
-                                self.acked_seqs.add(seq_num)
+                # SACKs
+                for l, r in sacks:
+                    s = l
+                    while s < r and s < file_size:
+                        if s >= self.base and s not in self.acked:
+                            self.acked.add(s)
+                        s += all_lens.get(s, MSS)
                 
-                # Handle duplicate ACK
-                if ack_num == self.last_ack:
-                    if ack_num not in self.dup_ack_count:
-                        self.dup_ack_count[ack_num] = 0
-                    self.dup_ack_count[ack_num] += 1
+                # Fast retransmit
+                if ack_num == last_ack_base:
+                    cnt = self.dup_acks.get(ack_num, 0) + 1
+                    self.dup_acks[ack_num] = cnt
                     
-                    # Fast retransmit after 3 duplicate ACKs
-                    if self.dup_ack_count[ack_num] == 3:
-                        base_seq = self.packets[self.base][0]
-                        if base_seq not in self.acked_seqs:
-                            print(f"[SERVER] Fast retransmit: seq {base_seq}")
-                            seq_num, packet, data_len = self.packets[self.base]
-                            self.sock.sendto(packet, client_addr)
-                            self.retransmissions += 1
-                            self.fast_retransmits += 1
-                            self.timer_start = time.time()
-                            self.packet_timeouts[seq_num] = time.time() + self.RTO
+                    if cnt == 3 and self.base not in self.acked and self.base in self.packets:
+                        self.sock.sendto(self.packets[self.base], addr)
+                        self.retrans += 1
+                        self.fast_retrans += 1
+                        self.timeouts[self.base] = time.time() + self.rto
             
             except socket.timeout:
-                # Check for per-packet timeouts
-                self.check_packet_timeouts(client_addr)
+                self.check_timeouts(addr)
         
-        end_time = time.time()
-        duration = end_time - start_time
+        elapsed = time.time() - start
         
-        print(f"\n[SERVER] Transfer complete!")
-        print(f"[SERVER] Time: {duration:.2f}s")
-        print(f"[SERVER] Throughput: {len(file_data) * 8 / duration / 1_000_000:.2f} Mbps")
-        print(f"[SERVER] Total packets sent: {self.packets_sent}")
-        print(f"[SERVER] Retransmissions: {self.retransmissions} "
-              f"({100*self.retransmissions/max(1,self.packets_sent):.1f}%)")
-        print(f"[SERVER] Fast retransmits: {self.fast_retransmits}")
-        print(f"[SERVER] Final RTO: {self.RTO:.4f}s")
+        print(f"\n[SERVER] Complete!")
+        print(f"[SERVER] Time: {elapsed:.2f}s")
+        print(f"[SERVER] Throughput: {file_size * 8 / elapsed / 1_000_000:.2f} Mbps")
+        print(f"[SERVER] Sent: {self.sent}")
+        print(f"[SERVER] Retrans: {self.retrans} ({100*self.retrans/max(1,self.sent):.1f}%)")
+        print(f"[SERVER] Fast retrans: {self.fast_retrans}")
+        print(f"[SERVER] Final RTO: {self.rto:.4f}s")
+        
+        # EOF
+        print(f"[SERVER] Sending EOF...")
+        eof = self.make_pkt(file_size, b'EOF')
+        for _ in range(5):
+            self.sock.sendto(eof, addr)
+            time.sleep(0.02)
     
     def run(self):
-        """Main server loop"""
         print(f"[SERVER] Listening on {self.ip}:{self.port}")
-        print(f"[SERVER] Sender window size: {self.sws} bytes")
         
         try:
-            # Wait for client request (with no timeout)
-            print(f"[SERVER] Waiting for client request...")
-            self.sock.settimeout(None)  # Block until we get a request
-            data, client_addr = self.sock.recvfrom(1024)
-            print(f"[SERVER] Received request from {client_addr}")
+            self.sock.settimeout(None)
+            _, addr = self.sock.recvfrom(1024)
+            print(f"[SERVER] Client: {addr}")
             
-            # Now set short timeout for ACK reception during transfer
-            self.sock.settimeout(0.1)
-            
-            # Send file
-            self.send_file(client_addr, 'data.txt')
+            self.send_file(addr, 'data.txt')
             
         except KeyboardInterrupt:
-            print("\n[SERVER] Shutting down...")
+            print("\n[SERVER] Stopped")
         except Exception as e:
             print(f"[ERROR] {e}")
             import traceback
@@ -343,12 +278,8 @@ class ReliableUDPServer:
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print("Usage: python3 p1_server.py <SERVER_IP> <SERVER_PORT> <SWS>")
+        print("Usage: python3 p1_server.py <IP> <PORT> <SWS>")
         sys.exit(1)
     
-    server_ip = sys.argv[1]
-    server_port = int(sys.argv[2])
-    sws = int(sys.argv[3])
-    
-    server = ReliableUDPServer(server_ip, server_port, sws)
-    server.run()
+    srv = ReliableUDPServer(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]))
+    srv.run()

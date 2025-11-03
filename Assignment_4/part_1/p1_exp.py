@@ -57,7 +57,7 @@ def run(expname):
     SERVER_PORT = 6555
     SWS = 5 * 1180
             
-    NUM_ITERATIONS = 5 
+    NUM_ITERATIONS = 1 
     OUTFILE = 'received_data.txt'
     delay_list, loss_list, jitter_list = [], [], []
 
@@ -68,7 +68,7 @@ def run(expname):
     elif expname == "jitter":
         delay_list = [20]    
         loss_list = [1]     
-        jitter_list = [20, 40, 60, 80, 100]
+        jitter_list = [20]
     else:
         print("Unknown experiment name. Use 'loss' or 'jitter'.")
         f_out.close()

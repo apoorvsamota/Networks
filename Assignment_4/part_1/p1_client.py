@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Part 1 Client: Reliable UDP File Transfer
-Optimized for speed while maintaining reliability
+Optimized for speed
 """
 
 import socket
@@ -9,7 +9,7 @@ import sys
 import struct
 import time
 
-# Constants - optimized for speed
+# Constants
 HEADER_SIZE = 20
 MAX_PAYLOAD = 1200
 REQUEST_TIMEOUT = 2.0
@@ -20,253 +20,198 @@ class ReliableUDPClient:
         self.server_ip = server_ip
         self.server_port = server_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(REQUEST_TIMEOUT)
         
-        # State variables
-        self.expected_seq = 0  # Next expected sequence number
-        self.buffer = {}  # Out-of-order buffer: {seq_num: data}
-        self.file_data = bytearray()  # Accumulated file data
+        # State
+        self.expected_seq = 0
+        self.buffer = {}
+        self.file_data = bytearray()
         
-        # Statistics
-        self.packets_received = 0
+        # Stats
+        self.pkts_recv = 0
         self.acks_sent = 0
-        self.out_of_order_count = 0
-        self.duplicate_count = 0
+        self.ooo_count = 0
+        self.dup_count = 0
         
-    def parse_packet(self, packet):
-        """Parse packet header and extract data"""
-        if len(packet) < HEADER_SIZE:
+    def parse_pkt(self, pkt):
+        if len(pkt) < HEADER_SIZE:
             return None, None
         
-        seq_num = struct.unpack('!I', packet[:4])[0]
-        data = packet[HEADER_SIZE:]  # Skip 20-byte header
-        return seq_num, data
+        seq = struct.unpack('!I', pkt[:4])[0]
+        data = pkt[HEADER_SIZE:]
+        return seq, data
     
-    def build_sack_info(self):
-        """Build SACK blocks from buffered out-of-order packets"""
+    def build_sacks(self):
         if not self.buffer:
             return []
         
-        # Get sorted sequence numbers
         sorted_seqs = sorted(self.buffer.keys())
-        sack_ranges = []
+        ranges = []
         
-        # Build contiguous ranges (limit to 2 for efficiency)
-        if sorted_seqs:
-            range_start = sorted_seqs[0]
-            range_end = range_start + len(self.buffer[range_start])
-            
-            for seq in sorted_seqs[1:]:
-                if seq == range_end:
-                    # Extend current range
-                    range_end = seq + len(self.buffer[seq])
-                else:
-                    # Save current range and start new one
-                    if len(sack_ranges) < 2:
-                        sack_ranges.append((range_start, range_end))
-                    range_start = seq
-                    range_end = seq + len(self.buffer[seq])
-            
-            # Add final range if space available
-            if len(sack_ranges) < 2:
-                sack_ranges.append((range_start, range_end))
+        start = sorted_seqs[0]
+        end = start + len(self.buffer[start])
         
-        return sack_ranges[:2]
+        for seq in sorted_seqs[1:]:
+            if seq == end:
+                end = seq + len(self.buffer[seq])
+            else:
+                if len(ranges) < 2:
+                    ranges.append((start, end))
+                start = seq
+                end = seq + len(self.buffer[seq])
+        
+        if len(ranges) < 2:
+            ranges.append((start, end))
+        
+        return ranges[:2]
     
     def send_ack(self, ack_num):
-        """Send cumulative ACK packet with SACK information"""
-        # ACK packet: 4 bytes for ACK number
-        ack_packet = struct.pack('!I', ack_num)
+        ack_pkt = struct.pack('!I', ack_num)
         
-        # Add SACK blocks (each is 8 bytes: start + end)
-        sack_blocks = self.build_sack_info()
-        for start, end in sack_blocks:
-            ack_packet += struct.pack('!II', start, end)
+        sacks = self.build_sacks()
+        for s, e in sacks:
+            ack_pkt += struct.pack('!II', s, e)
         
-        # Pad to 20 bytes
-        while len(ack_packet) < 20:
-            ack_packet += b'\x00'
+        while len(ack_pkt) < 20:
+            ack_pkt += b'\x00'
         
-        self.sock.sendto(ack_packet, (self.server_ip, self.server_port))
+        self.sock.sendto(ack_pkt, (self.server_ip, self.server_port))
         self.acks_sent += 1
         
-        # Reduced logging for performance
-        if self.acks_sent % 50 == 0 or sack_blocks:
-            if sack_blocks:
-                sack_info = ", ".join([f"[{s}-{e})" for s, e in sack_blocks])
-                print(f"[CLIENT] ACK={ack_num} SACK: {sack_info}")
+        if self.acks_sent % 50 == 0 or sacks:
+            if sacks:
+                sack_str = ", ".join([f"[{s}-{e})" for s, e in sacks])
+                print(f"[CLIENT] ACK={ack_num} SACK: {sack_str}")
     
     def request_file(self):
-        """Request file from server with retries"""
-        request = b'1'  # Single byte request
+        req = b'1'
         
         for attempt in range(MAX_REQUEST_RETRIES):
-            print(f"[CLIENT] Sending file request (attempt {attempt + 1}/{MAX_REQUEST_RETRIES})")
-            self.sock.sendto(request, (self.server_ip, self.server_port))
+            print(f"[CLIENT] Request attempt {attempt + 1}/{MAX_REQUEST_RETRIES}")
+            self.sock.sendto(req, (self.server_ip, self.server_port))
+            self.sock.settimeout(REQUEST_TIMEOUT)
             
             try:
-                # Wait for first packet
-                packet, addr = self.sock.recvfrom(MAX_PAYLOAD + 100)
-                print(f"[CLIENT] Received first packet from server")
-                return packet
+                pkt, _ = self.sock.recvfrom(MAX_PAYLOAD + 100)
+                print(f"[CLIENT] Got first packet")
+                return pkt
             except socket.timeout:
-                print(f"[CLIENT] Timeout on attempt {attempt + 1}")
                 if attempt == MAX_REQUEST_RETRIES - 1:
-                    print("[ERROR] Failed to connect to server after 5 attempts")
+                    print("[ERROR] No response from server")
                     return None
         
         return None
     
-    def receive_file(self, output_filename='received_data.txt'):
-        """Receive file from server using reliable UDP"""
-        print(f"[CLIENT] Connecting to server {self.server_ip}:{self.server_port}")
+    def deliver_buffered(self):
+        while self.expected_seq in self.buffer:
+            data = self.buffer.pop(self.expected_seq)
+            self.file_data.extend(data)
+            self.expected_seq += len(data)
+    
+    def receive_file(self, output='received_data.txt'):
+        print(f"[CLIENT] Connecting to {self.server_ip}:{self.server_port}")
         
-        # Request file and get first packet
-        first_packet = self.request_file()
-        if not first_packet:
+        first_pkt = self.request_file()
+        if not first_pkt:
             return False
         
-        print(f"[CLIENT] Starting file transfer...")
-        start_time = time.time()
-        last_print = start_time
-        overall_timeout = 300  # 5 minutes max for entire transfer
+        print(f"[CLIENT] Transfer starting...")
+        start = time.time()
+        last_print = start
         
-        # Process first packet
-        seq_num, data = self.parse_packet(first_packet)
-        if seq_num is None:
+        seq, data = self.parse_pkt(first_pkt)
+        if seq is None:
             print("[ERROR] Invalid first packet")
             return False
         
-        # Check for immediate EOF (empty file)
         if data == b'EOF':
-            print("[CLIENT] Received EOF immediately - empty file")
-            with open(output_filename, 'wb') as f:
+            print("[CLIENT] Empty file")
+            with open(output, 'wb') as f:
                 f.write(b'')
-            self.send_ack(seq_num + 3)
             return True
         
-        # Add first packet data
         self.file_data.extend(data)
         self.expected_seq = len(data)
-        self.packets_received += 1
+        self.pkts_recv += 1
         self.send_ack(self.expected_seq)
         
-        # Set balanced timeout for data reception
-        self.sock.settimeout(2.0)
+        # NO timeout - blocking receive
+        self.sock.settimeout(None)
         
-        # Receive remaining packets
         eof_received = False
-        consecutive_timeouts = 0
         
         while not eof_received:
-            # Check overall timeout
-            if time.time() - start_time > overall_timeout:
-                print(f"[ERROR] Overall timeout ({overall_timeout}s) exceeded!")
-                print(f"[ERROR] Received {len(self.file_data)} bytes before timeout")
-                return False
-            
             try:
-                packet, addr = self.sock.recvfrom(MAX_PAYLOAD + 100)
-                consecutive_timeouts = 0  # Reset timeout counter
+                pkt, _ = self.sock.recvfrom(MAX_PAYLOAD + 100)
                 
-                seq_num, data = self.parse_packet(packet)
-                if seq_num is None:
+                seq, data = self.parse_pkt(pkt)
+                if seq is None:
                     continue
                 
-                self.packets_received += 1
+                self.pkts_recv += 1
                 
-                # Check for EOF
                 if data == b'EOF':
-                    print(f"[CLIENT] Received EOF packet (seq {seq_num})")
-                    self.send_ack(seq_num + 3)  # ACK the EOF
+                    print(f"[CLIENT] EOF received")
                     eof_received = True
                     break
                 
-                if seq_num == self.expected_seq:
-                    # In-order packet - deliver immediately
+                if seq == self.expected_seq:
                     self.file_data.extend(data)
                     self.expected_seq += len(data)
-                    
-                    # Check buffer for consecutive packets
-                    while self.expected_seq in self.buffer:
-                        buffered_data = self.buffer.pop(self.expected_seq)
-                        self.file_data.extend(buffered_data)
-                        self.expected_seq += len(buffered_data)
-                    
-                    # Send cumulative ACK with SACK
+                    self.deliver_buffered()
                     self.send_ack(self.expected_seq)
                     
-                elif seq_num > self.expected_seq:
-                    # Out-of-order packet - buffer it
-                    if seq_num not in self.buffer:
-                        self.buffer[seq_num] = data
-                        self.out_of_order_count += 1
+                elif seq > self.expected_seq:
+                    if seq not in self.buffer:
+                        self.buffer[seq] = data
+                        self.ooo_count += 1
                     else:
-                        self.duplicate_count += 1
-                    
-                    # Send ACK with SACK to inform server
+                        self.dup_count += 1
                     self.send_ack(self.expected_seq)
                     
                 else:
-                    # Old packet (already received) - send ACK again
-                    self.duplicate_count += 1
+                    self.dup_count += 1
                     self.send_ack(self.expected_seq)
                 
-                # Progress update
                 if time.time() - last_print > 1.0:
                     print(f"[CLIENT] Received: {len(self.file_data)} bytes | "
-                          f"Packets: {self.packets_received} | "
-                          f"ACKs sent: {self.acks_sent} | "
-                          f"Buffered: {len(self.buffer)}")
+                          f"Buffered: {len(self.buffer)} | Packets: {self.pkts_recv}")
                     last_print = time.time()
                     
-            except socket.timeout:
-                consecutive_timeouts += 1
-                print(f"[CLIENT] Timeout waiting for packet (expected seq: {self.expected_seq})")
-                
-                # Resend ACK in case it was lost
-                self.send_ack(self.expected_seq)
-                
-                # If we've had too many consecutive timeouts, give up
-                if consecutive_timeouts > 25:
-                    print("[ERROR] Too many consecutive timeouts (25) - transfer failed!")
-                    print(f"[ERROR] Expected seq: {self.expected_seq}, Received: {len(self.file_data)} bytes")
-                    return False
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                break
         
-        end_time = time.time()
-        duration = end_time - start_time
+        elapsed = time.time() - start
         
-        # Write to file
-        print(f"\n[CLIENT] Writing {len(self.file_data)} bytes to '{output_filename}'")
+        print(f"\n[CLIENT] Writing {len(self.file_data)} bytes to '{output}'")
         try:
-            with open(output_filename, 'wb') as f:
+            with open(output, 'wb') as f:
                 f.write(self.file_data)
         except Exception as e:
-            print(f"[ERROR] Failed to write file: {e}")
+            print(f"[ERROR] Write failed: {e}")
             return False
         
-        print(f"[CLIENT] Transfer complete!")
-        print(f"[CLIENT] Time: {duration:.2f}s")
-        print(f"[CLIENT] Bytes received: {len(self.file_data)}")
-        print(f"[CLIENT] Packets received: {self.packets_received}")
+        print(f"[CLIENT] Complete!")
+        print(f"[CLIENT] Time: {elapsed:.2f}s")
+        print(f"[CLIENT] Bytes: {len(self.file_data)}")
+        print(f"[CLIENT] Packets: {self.pkts_recv}")
         print(f"[CLIENT] ACKs sent: {self.acks_sent}")
-        print(f"[CLIENT] Out-of-order: {self.out_of_order_count}")
-        print(f"[CLIENT] Duplicates: {self.duplicate_count}")
-        print(f"[CLIENT] Throughput: {len(self.file_data) * 8 / duration / 1_000_000:.2f} Mbps")
+        print(f"[CLIENT] Out-of-order: {self.ooo_count}")
+        print(f"[CLIENT] Duplicates: {self.dup_count}")
+        print(f"[CLIENT] Throughput: {len(self.file_data) * 8 / elapsed / 1_000_000:.2f} Mbps")
         
         return True
     
-    def run(self, output_filename='received_data.txt'):
-        """Main client function"""
+    def run(self, output='received_data.txt'):
         try:
-            success = self.receive_file(output_filename)
+            success = self.receive_file(output)
             if success:
-                print(f"\n[SUCCESS] File saved to '{output_filename}'")
+                print(f"\n[SUCCESS] File saved to '{output}'")
             else:
-                print(f"\n[FAILURE] Transfer failed!")
+                print(f"\n[FAILURE] Transfer failed")
             return success
         except KeyboardInterrupt:
-            print("\n[CLIENT] Interrupted by user")
+            print("\n[CLIENT] Interrupted")
             return False
         except Exception as e:
             print(f"[ERROR] {e}")
@@ -281,9 +226,6 @@ if __name__ == "__main__":
         print("Usage: python3 p1_client.py <SERVER_IP> <SERVER_PORT>")
         sys.exit(1)
     
-    server_ip = sys.argv[1]
-    server_port = int(sys.argv[2])
-    
-    client = ReliableUDPClient(server_ip, server_port)
+    client = ReliableUDPClient(sys.argv[1], int(sys.argv[2]))
     success = client.run()
     sys.exit(0 if success else 1)
