@@ -57,7 +57,7 @@ def run(expname):
     SERVER_PORT = 6555
     SWS = 5 * 1180
             
-    NUM_ITERATIONS = 1 
+    NUM_ITERATIONS = 3 
     OUTFILE = 'received_data.txt'
     delay_list, loss_list, jitter_list = [], [], []
 
