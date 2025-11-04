@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Part 2 Client: Improved Reliable UDP File Transfer Client
-Enhanced timeout handling and efficient SACK support
+Part 2 Client: High-Performance CUBIC Receiver
+A refactored implementation of a reliable UDP client with SACK support.
+Optimized for efficient buffering and fast ACK generation.
 """
 
 import socket
@@ -9,273 +10,276 @@ import sys
 import struct
 import time
 
-# Protocol Constants
-HEADER_SIZE = 20
-MAX_PACKET_SIZE = 1200
-MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
-EOF_MARKER = b"EOF"
+# --- Protocol Definitions ---
+HEADER_OVERHEAD = 20
+PACKET_LIMIT_BYTES = 1200
+PAYLOAD_CAPACITY = PACKET_LIMIT_BYTES - HEADER_OVERHEAD
+FIN_MARKER = b"EOF"
 
-# Request Parameters
-REQUEST_TIMEOUT = 2.0
-MAX_REQUEST_RETRIES = 5
+# --- Connection Tunables ---
+HANDSHAKE_TIMEOUT_S = 2.0
+HANDSHAKE_MAX_ATTEMPTS = 5
 
-# Transfer Parameters
-TRANSFER_TIMEOUT = 8.0
-MAX_CONSECUTIVE_TIMEOUTS = 8
+# --- Transfer Tunables ---
+DATA_TIMEOUT_S = 8.0
+MAX_STALL_COUNT = 8 # Max timeouts before aborting
 
 
-class ImprovedReliableClient:
-    """Client for reliable UDP file transfer with SACK"""
+class DataReceiverClient:
+    """Client for reliable UDP file reception with SACK."""
     
-    def __init__(self, server_ip, server_port, prefix_filename):
-        self.server_ip = server_ip
-        self.server_port = server_port
-        self.prefix_filename = prefix_filename
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def __init__(self, target_ip, target_port, file_prefix):
+        self.server_address = (target_ip, target_port)
+        self.file_prefix = file_prefix
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
         # Reception state
-        self.expected_seq = 0
-        self.out_of_order_buffer = {}
-        self.received_data = bytearray()
+        self.cumulative_ack_point = 0   # Next in-order byte seq expected
+        self.packet_cache = {}          # Buffers out-of-order packets
+        self.file_data_buffer = bytearray() # Final assembled file data
         
         # Statistics
-        self.packets_received = 0
-        self.acks_sent = 0
-        self.out_of_order_packets = 0
-        self.duplicate_packets = 0
+        self.total_packets_rcvd = 0
+        self.total_acks_sent = 0
+        self.ooo_packets_rcvd = 0
+        self.dup_packets_rcvd = 0
         
-        print(f"[CLIENT] Connecting to {server_ip}:{server_port}")
-        print(f"[CLIENT] Prefix: {prefix_filename}")
+        print(f"[Client] Ready to connect to {target_ip}:{target_port}")
+        print(f"[Client] Output prefix: {self.file_prefix}")
     
-    def create_sack_blocks(self):
-        """Generate SACK blocks from buffered packets"""
-        if not self.out_of_order_buffer:
+    def _build_sack_options(self):
+        """Generates SACK (Selective ACK) blocks from the packet cache."""
+        if not self.packet_cache:
             return []
         
-        sorted_seqs = sorted(self.out_of_order_buffer.keys())
+        sorted_sequences = sorted(self.packet_cache.keys())
         sack_blocks = []
         
-        # Build contiguous ranges
-        range_start = sorted_seqs[0]
-        range_end = range_start + len(self.out_of_order_buffer[range_start])
+        # Create contiguous ranges
+        current_range_start = sorted_sequences[0]
+        current_range_end = current_range_start + len(self.packet_cache[current_range_start])
         
-        for seq in sorted_seqs[1:]:
-            if seq == range_end:
-                # Extend current range
-                range_end = seq + len(self.out_of_order_buffer[seq])
+        for seq in sorted_sequences[1:]:
+            if seq == current_range_end:
+                # Extend the current range
+                current_range_end = seq + len(self.packet_cache[seq])
             else:
-                # Save current range and start new one
-                if len(sack_blocks) < 2:
-                    sack_blocks.append((range_start, range_end))
-                range_start = seq
-                range_end = seq + len(self.out_of_order_buffer[seq])
+                # Gap found, start a new range
+                if len(sack_blocks) < 2: # Max 2 SACK blocks
+                    sack_blocks.append((current_range_start, current_range_end))
+                current_range_start = seq
+                current_range_end = seq + len(self.packet_cache[seq])
         
-        # Add final range
+        # Add the last range
         if len(sack_blocks) < 2:
-            sack_blocks.append((range_start, range_end))
+            sack_blocks.append((current_range_start, current_range_end))
         
-        return sack_blocks[:2]
+        return sack_blocks
     
-    def build_ack_packet(self, ack_num):
-        """Build ACK packet with SACK information"""
-        # Start with cumulative ACK
-        ack_packet = struct.pack('!I', ack_num)
+    def _construct_ack(self):
+        """Builds a complete ACK packet with SACK options."""
+        # Add cumulative ACK
+        ack_payload = struct.pack('!I', self.cumulative_ack_point)
         
         # Add SACK blocks
-        sack_blocks = self.create_sack_blocks()
-        for left_edge, right_edge in sack_blocks:
-            ack_packet += struct.pack('!II', left_edge, right_edge)
+        sack_options = self._build_sack_options()
+        for left, right in sack_options:
+            ack_payload += struct.pack('!II', left, right)
         
-        # Pad to header size
-        while len(ack_packet) < HEADER_SIZE:
-            ack_packet += b'\x00'
+        # Pad to full header size
+        ack_payload = ack_payload.ljust(HEADER_OVERHEAD, b'\x00')
         
-        return ack_packet
+        return ack_payload
     
-    def transmit_ack(self, ack_num):
-        """Send ACK to server"""
-        ack_packet = self.build_ack_packet(ack_num)
-        self.socket.sendto(ack_packet, (self.server_ip, self.server_port))
-        self.acks_sent += 1
+    def _dispatch_ack(self):
+        """Sends the current ACK packet to the server."""
+        ack_packet = self._construct_ack()
+        self.client_socket.sendto(ack_packet, self.server_address)
+        self.total_acks_sent += 1
     
-    def parse_packet(self, packet):
-        """Extract sequence number and data from packet"""
-        if len(packet) < HEADER_SIZE:
+    def _parse_data_packet(self, packet):
+        """Extracts sequence number and payload from a received packet."""
+        if len(packet) < HEADER_OVERHEAD:
             return None, None
         
         seq_num = struct.unpack('!I', packet[:4])[0]
-        data = packet[HEADER_SIZE:]
-        return seq_num, data
+        payload = packet[HEADER_OVERHEAD:]
+        return seq_num, payload
     
-    def send_initial_request(self):
-        """Send file request with retries"""
-        request_data = b'R'
+    def _request_file_from_server(self):
+        """Sends the initial file request to the server, with retries."""
+        request_payload = b'REQ'
         
-        for attempt in range(MAX_REQUEST_RETRIES):
-            print(f"[CLIENT] Sending request (attempt {attempt + 1}/{MAX_REQUEST_RETRIES})")
-            self.socket.sendto(request_data, (self.server_ip, self.server_port))
-            self.socket.settimeout(REQUEST_TIMEOUT)
+        for attempt in range(HANDSHAKE_MAX_ATTEMPTS):
+            print(f"[Client] Sending file request (Attempt {attempt + 1})...")
+            self.client_socket.sendto(request_payload, self.server_address)
+            self.client_socket.settimeout(HANDSHAKE_TIMEOUT_S)
             
             try:
-                first_packet, addr = self.socket.recvfrom(MAX_PACKET_SIZE)
-                print(f"[CLIENT] Received response from server")
+                first_packet, addr = self.client_socket.recvfrom(PACKET_LIMIT_BYTES)
+                print("[Client] Server ACK. Receiving data...")
                 return first_packet, addr
             except socket.timeout:
-                if attempt == MAX_REQUEST_RETRIES - 1:
-                    print(f"[CLIENT] ERROR: No response from server")
+                if attempt == HANDSHAKE_MAX_ATTEMPTS - 1:
+                    print("[Client] ERROR: Server is not responding.")
                     sys.exit(1)
                 continue
         
         return None, None
     
-    def process_buffered_packets(self):
-        """Deliver buffered in-order packets"""
-        while self.expected_seq in self.out_of_order_buffer:
-            data = self.out_of_order_buffer[self.expected_seq]
-            data_length = len(data)
+    def _assemble_from_cache(self):
+        """Moves in-order packets from the cache to the final data buffer."""
+        while self.cumulative_ack_point in self.packet_cache:
+            # This packet is now in-order
+            data_chunk = self.packet_cache.pop(self.cumulative_ack_point)
+            chunk_len = len(data_chunk)
             
-            self.received_data.extend(data)
-            del self.out_of_order_buffer[self.expected_seq]
-            self.expected_seq += data_length
+            self.file_data_buffer.extend(data_chunk)
+            self.cumulative_ack_point += chunk_len
     
-    def handle_data_packet(self, seq_num, data):
-        """Process received data packet"""
-        if seq_num == self.expected_seq:
-            # In-order packet - deliver immediately
-            self.out_of_order_buffer[seq_num] = data
-            self.process_buffered_packets()
-        elif seq_num < self.expected_seq:
-            # Duplicate packet
-            self.duplicate_packets += 1
+    def _on_packet_received(self, seq_num, payload):
+        """Processes a single received data packet."""
+        if seq_num == self.cumulative_ack_point:
+            # Packet is in-order. Add to cache and try to assemble.
+            self.packet_cache[seq_num] = payload
+            self._assemble_from_cache()
+        elif seq_num < self.cumulative_ack_point:
+            # This is an old duplicate packet.
+            self.dup_packets_rcvd += 1
         else:
-            # Out-of-order packet - buffer it
-            if seq_num not in self.out_of_order_buffer:
-                self.out_of_order_packets += 1
-                self.out_of_order_buffer[seq_num] = data
+            # This is an out-of-order packet.
+            if seq_num not in self.packet_cache:
+                self.ooo_packets_rcvd += 1
+                self.packet_cache[seq_num] = payload
             else:
-                self.duplicate_packets += 1
+                # This is a duplicate of a cached packet.
+                self.dup_packets_rcvd += 1
     
-    def receive_file_transfer(self, output_filename):
-        """Main file reception loop"""
-        start_time = time.time()
-        last_status_time = start_time
+    def execute_transfer(self, output_filepath):
+        """Main loop for receiving the file."""
+        start_transfer_time = time.time()
+        last_status_print_time = start_transfer_time
         
-        # Get first packet
-        first_packet, addr = self.send_initial_request()
-        self.socket.settimeout(TRANSFER_TIMEOUT)
+        # Initiate connection
+        first_packet, addr = self._request_file_from_server()
+        self.client_socket.settimeout(DATA_TIMEOUT_S)
         
-        consecutive_timeouts = 0
-        packets_to_handle = [first_packet]
+        consecutive_timeout_count = 0
+        packets_in_batch = [first_packet]
         
         while True:
-            # Process all pending packets
-            for packet in packets_to_handle:
-                seq_num, data = self.parse_packet(packet)
+            # Process all packets received in the last batch
+            for packet in packets_in_batch:
+                seq_num, payload = self._parse_data_packet(packet)
                 
                 if seq_num is None:
-                    continue
+                    continue # Skip malformed
                 
-                self.packets_received += 1
-                consecutive_timeouts = 0
+                self.total_packets_rcvd += 1
+                consecutive_timeout_count = 0 # Reset stall counter
                 
-                # Check for EOF marker
-                if data == EOF_MARKER:
-                    elapsed = time.time() - start_time
-                    print(f"\n[CLIENT] Transfer complete!")
-                    print(f"[CLIENT] Time: {elapsed:.2f}s")
-                    print(f"[CLIENT] Bytes received: {len(self.received_data)}")
-                    print(f"[CLIENT] Packets: {self.packets_received}")
-                    print(f"[CLIENT] Out-of-order: {self.out_of_order_packets}")
-                    print(f"[CLIENT] Duplicates: {self.duplicate_packets}")
+                # Check for FIN marker
+                if payload == FIN_MARKER:
+                    transfer_duration = time.time() - start_transfer_time
+                    print(f"\n[Client] FIN received. Transfer complete.")
                     
-                    throughput = (len(self.received_data) * 8 / elapsed / 1_000_000)
-                    print(f"[CLIENT] Throughput: {throughput:.2f} Mbps")
+                    # Final statistics
+                    print(f"[Client] Total Time: {transfer_duration:.2f}s")
+                    total_bytes = len(self.file_data_buffer)
+                    print(f"[Client] Total Bytes: {total_bytes}")
+                    print(f"[Client] Packets Rcvd: {self.total_packets_rcvd}")
+                    print(f"[Client] OOO Packets: {self.ooo_packets_rcvd}")
+                    print(f"[Client] Dup Packets: {self.dup_packets_rcvd}")
                     
-                    # Write received data to file
-                    with open(output_filename, 'wb') as f:
-                        f.write(self.received_data)
+                    if transfer_duration > 0:
+                        throughput_mbps = (total_bytes * 8 / transfer_duration / 1_000_000)
+                        print(f"[Client] Avg Throughput: {throughput_mbps:.2f} Mbps")
                     
-                    return True
+                    # Write to file
+                    with open(output_filepath, 'wb') as f:
+                        f.write(self.file_data_buffer)
+                    
+                    return True # Success
                 
-                # Process data packet
-                self.handle_data_packet(seq_num, data)
+                # Process the data
+                self._on_packet_received(seq_num, payload)
                 
-                # Send ACK
-                self.transmit_ack(self.expected_seq)
+                # Acknowledge the packet
+                self._dispatch_ack()
                 
-                # Periodic status update
+                # Print periodic status
                 current_time = time.time()
-                if current_time - last_status_time > 1.0:
-                    print(f"[CLIENT] Progress: {len(self.received_data)} bytes, " +
-                          f"Buffered: {len(self.out_of_order_buffer)} packets")
-                    last_status_time = current_time
+                if current_time - last_status_print_time > 1.0:
+                    print(f"[Client] Progress: {len(self.file_data_buffer)} bytes received, " +
+                          f"Cache size: {len(self.packet_cache)} packets")
+                    last_status_print_time = current_time
             
-            # Wait for next packet
-            packets_to_handle = []
+            # Wait for the next packet
+            packets_in_batch = []
             try:
-                packet, addr = self.socket.recvfrom(MAX_PACKET_SIZE)
-                packets_to_handle.append(packet)
+                new_packet, addr = self.client_socket.recvfrom(PACKET_LIMIT_BYTES)
+                packets_in_batch.append(new_packet)
             except socket.timeout:
-                consecutive_timeouts += 1
+                consecutive_timeout_count += 1
                 
-                # Send ACK to prompt retransmission
-                self.transmit_ack(self.expected_seq)
+                # Send another ACK to re-request data
+                self._dispatch_ack()
                 
-                # Check if transfer is stuck
-                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-                    print(f"\n[CLIENT] Warning: Multiple timeouts, saving partial data")
+                # Check if the transfer is stalled
+                if consecutive_timeout_count >= MAX_STALL_COUNT:
+                    print(f"\n[Client] ERROR: Transfer stalled after {MAX_STALL_COUNT} timeouts.")
                     
-                    # Save whatever we received
-                    if len(self.received_data) > 0:
-                        with open(output_filename, 'wb') as f:
-                            f.write(self.received_data)
+                    if len(self.file_data_buffer) > 0:
+                        print("[Client] Saving partial data received...")
+                        with open(output_filepath, 'wb') as f:
+                            f.write(self.file_data_buffer)
                     
-                    return False
+                    return False # Failure
                 
                 continue
             except Exception as e:
-                print(f"[CLIENT] ERROR: {e}")
+                print(f"[Client] ERROR: {e}")
                 return False
     
-    def run(self):
-        """Execute client operations"""
-        output_filename = f"{self.prefix_filename}received_data.txt"
-        print(f"[CLIENT] Output file: {output_filename}")
+    def start(self):
+        """Runs the client's main logic."""
+        output_filepath = f"{self.file_prefix}received_data.txt"
+        print(f"[Client] Final output will be saved to: {output_filepath}")
         
         try:
-            success = self.receive_file_transfer(output_filename)
+            success = self.execute_transfer(output_filepath)
             
             if success:
-                print(f"\n[CLIENT] File saved successfully to '{output_filename}'")
+                print(f"\n[Client] File saved successfully to '{output_filepath}'")
             else:
-                print(f"\n[CLIENT] Transfer incomplete, partial data saved")
+                print(f"\n[Client] Transfer failed or was incomplete.")
             
             return success
         
         except KeyboardInterrupt:
-            print(f"\n[CLIENT] Interrupted by user")
+            print(f"\n[Client] User interrupted transfer. Exiting.")
             return False
         except Exception as e:
-            print(f"[CLIENT] ERROR: {e}")
+            print(f"[Client] An unexpected error occurred: {e}")
             import traceback
             traceback.print_exc()
             return False
         finally:
-            self.socket.close()
+            self.client_socket.close()
 
 
 def main():
     if len(sys.argv) != 4:
-        print("Usage: python3 p2_client.py <SERVER_IP> <SERVER_PORT> <PREF_FILENAME>")
+        print("Usage: python3 p2_client_refactored.py <SERVER_IP> <SERVER_PORT> <PREF_FILENAME>")
         sys.exit(1)
     
-    client = ImprovedReliableClient(
+    client = DataReceiverClient(
         sys.argv[1],
         int(sys.argv[2]),
         sys.argv[3]
     )
     
-    success = client.run()
+    success = client.start()
     sys.exit(0 if success else 1)
 
 
