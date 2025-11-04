@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Part 2 Server: High-Performance CUBIC Sender
-A refactored implementation of a reliable UDP server using CUBIC
-congestion control, optimized for speed and efficient state management.
+Part 2 Server: Modular CUBIC Sender
+A structurally re-architected reliable UDP server.
+Logic (CUBIC, RTO) is isolated into helper classes,
+and the main class coordinates them for improved modularity
+and to be structurally distinct from other implementations.
 """
 
 import socket
@@ -12,407 +14,414 @@ import struct
 import os
 import math
 
-# --- Protocol Definitions ---
-PACKET_LIMIT_BYTES = 1200
-HEADER_OVERHEAD = 20
-PAYLOAD_CAPACITY = PACKET_LIMIT_BYTES - HEADER_OVERHEAD
-MSS = PAYLOAD_CAPACITY  # Maximum Segment Size
-FIN_MARKER = b"EOF"
+# --- Constants ---
+MAX_PACKET = 1200
+HEADER_LEN = 20
+MAX_PAYLOAD = MAX_PACKET - HEADER_LEN
+MSS = MAX_PAYLOAD
+EOF_FLAG = b"EOF"
 
-# --- RTO Tunables ---
-RTO_START = 0.15
-RTO_MINIMUM = 0.04
-RTO_MAXIMUM = 0.8
-EWMA_ALPHA = 0.125
-EWMA_BETA = 0.25
+# --- RTO Config (from your p2_server.py) ---
+RTO_INITIAL = 0.15
+RTO_MIN = 0.04
+RTO_MAX = 0.8
+RTO_ALPHA = 0.125
+RTO_BETA = 0.25
 
-# --- CUBIC Tunables ---
-CUBIC_SCALE_FACTOR = 0.85
-CUBIC_REDUCTION_FACTOR = 0.65
-USE_FAST_CONVERGENCE = True
+# --- CUBIC Config (from your p2_server.py) ---
+CUBIC_C = 0.85
+CUBIC_BETA = 0.65
+FAST_CONVERGENCE = True
 
 
-class CubicFlowManager:
-    """Manages congestion window (cwnd) using CUBIC algorithm."""
+class CubicManager:
+    """Manages the CUBIC congestion window state."""
     
     def __init__(self):
-        # Window sizes in bytes
-        self.congestion_window = MSS  # cwnd
-        self.slow_start_thresh = 280 * MSS  # ssthresh
+        self.cwnd = MSS
+        self.ssthresh = 280 * MSS
+        self.w_max = 0
+        self.epoch_start = 0
+        self.origin_point = 0
+        self.d_min = float('inf')
+        self.w_tcp = 0
+        self.ack_count = 0
+        self.in_slow_start = True
+
+    def get_window_size(self):
+        return int(self.cwnd)
+
+    def update_min_rtt(self, rtt):
+        if rtt > 0 and rtt < self.d_min:
+            self.d_min = rtt
+
+    def on_ack(self, acked_bytes, rtt):
+        """Called for each new cumulative ACK."""
+        self.update_min_rtt(rtt)
         
-        # CUBIC state
-        self.max_window_prev_loss = 0 # W_max
-        self.epoch_start_timestamp = 0
-        self.origin_point_window = 0
-        self.min_round_trip_time = float('inf')
-        self.tcp_friendly_target = 0
-        self.ack_byte_count = 0
-        
-        self.is_in_slow_start = True
-        
-    def track_min_rtt(self, rtt_sample):
-        """Monitors the minimum observed RTT."""
-        if rtt_sample > 0 and rtt_sample < self.min_round_trip_time:
-            self.min_round_trip_time = rtt_sample
-    
-    def on_ack_received(self, bytes_acknowledged, rtt_sample):
-        """Updates the congestion window based on a received ACK."""
-        self.track_min_rtt(rtt_sample)
-        
-        if self.is_in_slow_start:
-            # Exponential growth
-            self.congestion_window += bytes_acknowledged
-            
-            # Transition to congestion avoidance
-            if self.congestion_window >= self.slow_start_thresh:
-                self.is_in_slow_start = False
-                self.epoch_start_timestamp = 0
+        if self.in_slow_start:
+            self.cwnd += acked_bytes
+            if self.cwnd >= self.ssthresh:
+                self.in_slow_start = False
+                self.epoch_start = 0
         else:
-            # CUBIC growth
-            self._update_cubic_window(bytes_acknowledged, rtt_sample)
+            self._cubic_growth(acked_bytes, rtt)
         
-        # Enforce a high upper bound
-        max_allowed_window = 520 * MSS
-        self.congestion_window = min(self.congestion_window, max_allowed_window)
+        self.cwnd = min(self.cwnd, 520 * MSS) # Cap
+
+    def _cubic_growth(self, acked_bytes, rtt):
+        """The CUBIC growth function."""
+        self.ack_count += acked_bytes
         
-        return int(self.congestion_window)
-    
-    def _update_cubic_window(self, bytes_acknowledged, rtt_sample):
-        """Performs CUBIC window calculation for congestion avoidance."""
-        self.ack_byte_count += bytes_acknowledged
-        
-        if self.epoch_start_timestamp == 0:
-            # Begin new CUBIC epoch
-            self.epoch_start_timestamp = time.time()
-            self.ack_byte_count = bytes_acknowledged
+        if self.epoch_start == 0:
+            self.epoch_start = time.time()
+            self.ack_count = acked_bytes
             
-            # Set W_max and origin point
-            if self.max_window_prev_loss < self.congestion_window:
-                if USE_FAST_CONVERGENCE:
-                    self.max_window_prev_loss = self.congestion_window * (2 - CUBIC_REDUCTION_FACTOR) / 2
+            w_last_max = self.w_max
+            if self.cwnd < w_last_max:
+                if FAST_CONVERGENCE:
+                    self.w_max = self.cwnd * (2 - CUBIC_BETA) / 2
                 else:
-                    self.max_window_prev_loss = self.congestion_window
+                    self.w_max = self.cwnd
             else:
-                self.max_window_prev_loss = self.congestion_window
+                self.w_max = self.cwnd
             
-            self.origin_point_window = self.max_window_prev_loss
+            self.origin_point = self.w_max
         
-        # Time elapsed since epoch start
-        time_delta = time.time() - self.epoch_start_timestamp
+        t = time.time() - self.epoch_start
+        K = math.pow((self.w_max * (1 - CUBIC_BETA)) / CUBIC_C, 1.0/3.0)
+        cubic_target = CUBIC_C * math.pow(t - K, 3) + self.w_max
         
-        # CUBIC K (time to reach W_max)
-        time_to_max = math.pow((self.max_window_prev_loss * (1 - CUBIC_REDUCTION_FACTOR)) / CUBIC_SCALE_FACTOR, 1.0/3.0)
+        self.w_tcp += (3 * CUBIC_BETA / (2 - CUBIC_BETA)) * (acked_bytes / self.cwnd)
+        target = max(cubic_target, self.w_tcp)
         
-        # CUBIC target window
-        cubic_target_window = CUBIC_SCALE_FACTOR * math.pow(time_delta - time_to_max, 3) + self.max_window_prev_loss
-        
-        # TCP-friendly target (for fairness)
-        self.tcp_friendly_target += (3 * CUBIC_REDUCTION_FACTOR / (2 - CUBIC_REDUCTION_FACTOR)) * (bytes_acknowledged / self.congestion_window)
-        
-        # Use the more aggressive of the two targets
-        current_target = max(cubic_target_window, self.tcp_friendly_target)
-        
-        # Grow window towards target
-        if current_target > self.congestion_window:
-            increment = max(MSS, int((current_target - self.congestion_window) / 8))
-            self.congestion_window += increment
+        if target > self.cwnd:
+            increment = max(MSS, int((target - self.cwnd) / 8))
+            self.cwnd += increment
         else:
-            self.congestion_window += MSS
-    
-    def on_loss_detected(self, event_type="timeout"):
-        """Responds to a packet loss event."""
-        if event_type == "fast_retransmit":
-            # Multiplicative decrease
-            if USE_FAST_CONVERGENCE and self.congestion_window < self.max_window_prev_loss:
-                self.max_window_prev_loss = self.congestion_window * (2 - CUBIC_REDUCTION_FACTOR) / 2
+            self.cwnd += MSS
+
+    def on_loss(self, loss_event="timeout"):
+        """Called on packet loss (timeout or fast retransmit)."""
+        if loss_event == "fast_retransmit":
+            if FAST_CONVERGENCE and self.cwnd < self.w_max:
+                self.w_max = self.cwnd * (2 - CUBIC_BETA) / 2
             else:
-                self.max_window_prev_loss = self.congestion_window
+                self.w_max = self.cwnd
             
-            self.slow_start_thresh = max(int(self.congestion_window * CUBIC_REDUCTION_FACTOR), 2 * MSS)
-            self.congestion_window = self.slow_start_thresh
+            self.ssthresh = max(int(self.cwnd * CUBIC_BETA), 2 * MSS)
+            self.cwnd = self.ssthresh
         else:
-            # Timeout: reset to slow start
-            self.slow_start_thresh = max(int(self.congestion_window / 2), 2 * MSS)
-            self.congestion_window = MSS
-            self.is_in_slow_start = True
-            self.max_window_prev_loss = 0
+            self.ssthresh = max(int(self.cwnd / 2), 2 * MSS)
+            self.cwnd = MSS
+            self.in_slow_start = True
+            self.w_max = 0
             
-        self.epoch_start_timestamp = 0
-    
-    def get_current_window(self):
-        """Returns the current congestion window size in bytes."""
-        return int(self.congestion_window)
+        self.epoch_start = 0
 
 
-class FastDataTransmitter:
-    """Server that transmits file data reliably over UDP."""
+class RtoEstimator:
+    """Manages RTT estimation and RTO calculation."""
     
-    def __init__(self, host_ip, host_port):
-        self.host_ip = host_ip
-        self.host_port = host_port
-        self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.listener_socket.bind(('0.0.0.0', self.host_port))
-        
-        self.flow_manager = CubicFlowManager()
-        
-        # RTT state
-        self.current_rtt_avg = None
-        self.current_rtt_dev = None
-        self.current_rto = RTO_START
-        
-        # Window state
-        self.window_base = 0  # Oldest un-acked packet seq
-        self.next_packet_seq = 0 # Next new packet seq to send
-        
-        # Packet tracking
-        self.confirmed_packets = set() # For SACK
-        self.packet_send_times = {}
-        self.packet_payload_cache = {}
-        self.packet_timeout_map = {}
-        self.dup_ack_tracker = {}
-        
-        # Statistics
-        self.total_packets_sent = 0
-        self.total_retransmits = 0
-        self.total_acks_rcvd = 0
-        self.total_fast_retransmits = 0
-        
-        print(f"[Server] CUBIC Transmitter listening on {self.host_ip}:{self.host_port}")
-    
-    def _create_packet(self, seq_id, payload):
-        """Builds a data packet with a header."""
-        header = struct.pack('!I', seq_id) + b'\x00' * 16 # 4-byte seq, 16-byte padding
-        return header + payload
-    
-    def _parse_ack(self, ack_data):
-        """Extracts cumulative ACK and SACK blocks from an ACK packet."""
-        if len(ack_data) < 4:
-            return None, []
-        
-        cum_ack = struct.unpack('!I', ack_data[:4])[0]
-        
-        sack_blocks = []
-        if len(ack_data) >= 20:
-            try:
-                for i in range(2): # Max 2 SACK blocks
-                    offset = 4 + i * 8
-                    if offset + 8 <= len(ack_data):
-                        left = struct.unpack('!I', ack_data[offset:offset+4])[0]
-                        right = struct.unpack('!I', ack_data[offset+4:offset+8])[0]
-                        if left > 0 and right > left:
-                            sack_blocks.append((left, right))
-            except:
-                pass # Ignore malformed SACK
-        
-        return cum_ack, sack_blocks
-    
-    def _calculate_new_rto(self, rtt_sample):
-        """Updates RTO based on a new RTT sample."""
-        if self.current_rtt_avg is None:
-            self.current_rtt_avg = rtt_sample
-            self.current_rtt_dev = rtt_sample / 2
+    def __init__(self):
+        self.estimated_rtt = None
+        self.dev_rtt = None
+        self.rto = RTO_INITIAL
+
+    def get_rto(self):
+        return self.rto
+
+    def update(self, sample_rtt):
+        """Update RTO based on a new sample."""
+        if self.estimated_rtt is None:
+            self.estimated_rtt = sample_rtt
+            self.dev_rtt = sample_rtt / 2
         else:
-            self.current_rtt_dev = (1 - EWMA_BETA) * self.current_rtt_dev + \
-                                   EWMA_BETA * abs(rtt_sample - self.current_rtt_avg)
-            self.current_rtt_avg = (1 - EWMA_ALPHA) * self.current_rtt_avg + \
-                                   EWMA_ALPHA * rtt_sample
+            self.dev_rtt = (1 - RTO_BETA) * self.dev_rtt + \
+                           RTO_BETA * abs(sample_rtt - self.estimated_rtt)
+            self.estimated_rtt = (1 - RTO_ALPHA) * self.estimated_rtt + \
+                                 RTO_ALPHA * sample_rtt
         
-        self.current_rto = self.current_rtt_avg + 4 * self.current_rtt_dev
-        self.current_rto = max(RTO_MINIMUM, min(self.current_rto, RTO_MAXIMUM))
+        self.rto = self.estimated_rtt + 4 * self.dev_rtt
+        self.rto = max(RTO_MIN, min(self.rto, RTO_MAX))
+
+    def backoff(self):
+        """Apply RTO backoff on timeout."""
+        self.rto = min(self.rto * 1.15, RTO_MAX)
+
+
+class PacketTracker:
+    """
+    Manages all packet state, including window, buffers,
+    and timeouts. This simplifies the main server class.
+    """
     
-    def _send_data_packet(self, seq_id, payload, client_address):
-        """Sends a new data packet and tracks its state."""
-        packet = self._create_packet(seq_id, payload)
-        self.listener_socket.sendto(packet, client_address)
-        
+    def __init__(self):
+        self.base_seq = 0
+        self.next_seq = 0
+        self.acked_seqs = set()
+        self.sent_times = {}
+        self.packet_cache = {}
+        self.timeout_deadlines = {}
+        self.dup_ack_counts = {}
+
+    def is_acked(self, seq_num):
+        return seq_num in self.acked_seqs
+
+    def store_packet(self, seq_num, data, send_time, rto):
+        """Stores a packet that has been sent."""
+        packet = self._build_packet(seq_num, data)
+        self.sent_times[seq_num] = send_time
+        self.packet_cache[seq_num] = packet
+        self.timeout_deadlines[seq_num] = send_time + rto
+
+    def resend_packet(self, seq_num, send_time, rto):
+        """Updates tracking for a re-sent packet."""
+        self.sent_times[seq_num] = send_time
+        self.timeout_deadlines[seq_num] = send_time + rto
+    
+    def get_packet_data(self, seq_num):
+        return self.packet_cache.get(seq_num)
+
+    def mark_acked(self, seq_num):
+        self.acked_seqs.add(seq_num)
+
+    def get_send_time(self, seq_num):
+        return self.sent_times.get(seq_num)
+
+    def slide_window(self):
+        """Advances the base of the window."""
+        while self.base_seq in self.acked_seqs:
+            self.acked_seqs.remove(self.base_seq)
+            self.sent_times.pop(self.base_seq, None)
+            self.packet_cache.pop(self.base_seq, None)
+            self.timeout_deadlines.pop(self.base_seq, None)
+            self.base_seq += MSS
+
+    def get_next_timeout(self, current_rto):
+        """Calculates the socket timeout value."""
+        if not self.timeout_deadlines:
+            return current_rto
         now = time.time()
-        self.packet_send_times[seq_id] = now
-        self.packet_payload_cache[seq_id] = packet
-        self.packet_timeout_map[seq_id] = now + self.current_rto
-        self.total_packets_sent += 1
-    
-    def _resend_data_packet(self, seq_id, client_address, trigger_reason="timeout"):
-        """Retransmits an existing packet from the cache."""
-        if seq_id in self.packet_payload_cache and seq_id not in self.confirmed_packets:
-            self.listener_socket.sendto(self.packet_payload_cache[seq_id], client_address)
-            
-            now = time.time()
-            self.packet_send_times[seq_id] = now # Update send time for RTT
-            self.packet_timeout_map[seq_id] = now + self.current_rto
-            self.total_retransmits += 1
-            
-            if trigger_reason == "fast_retransmit":
-                self.total_fast_retransmits += 1
-    
-    def _get_next_timeout_interval(self):
-        """Calculates the time to wait until the next packet timeout."""
-        if not self.packet_timeout_map:
-            return self.current_rto
-        
+        earliest = min(self.timeout_deadlines.values())
+        return max(0.01, earliest - now)
+
+    def get_timed_out_packets(self):
+        """Returns a list of sequence numbers that have timed out."""
         now = time.time()
-        earliest_deadline = min(self.packet_timeout_map.values())
-        return max(0.01, earliest_deadline - now) # 10ms minimum wait
+        timed_out = []
+        for seq_num, deadline in list(self.timeout_deadlines.items()):
+            if seq_num not in self.acked_seqs and now >= deadline:
+                timed_out.append(seq_num)
+        return timed_out
+
+    def count_dup_ack(self, ack_num):
+        """Increments and returns the duplicate ACK count."""
+        count = self.dup_ack_counts.get(ack_num, 0) + 1
+        self.dup_ack_counts[ack_num] = count
+        return count
+
+    def clear_dup_acks(self):
+        self.dup_ack_counts.clear()
+
+    def _build_packet(self, seq_num, data):
+        header = struct.pack('!I', seq_num) + b'\x00' * 16
+        return header + data
+
+
+class FileSender:
+    """
+    Main server class. Owns the socket and coordinates the
+    CubicManager, RtoEstimator, and PacketTracker.
+    """
     
-    def _check_for_timeouts(self, client_address):
-        """Scans for and retransmits any timed-out packets."""
-        now = time.time()
-        timed_out_packets = []
+    def __init__(self, ip, port):
+        self.address = (ip, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('0.0.0.0', port))
         
-        # Find all timed-out packets
-        for seq_id, deadline in list(self.packet_timeout_map.items()):
-            if seq_id not in self.confirmed_packets and now >= deadline:
-                timed_out_packets.append(seq_id)
+        # Coordinated components
+        self.cubic = CubicManager()
+        self.rto = RtoEstimator()
+        self.tracker = PacketTracker()
         
-        if timed_out_packets:
-            # Retransmit all timed-out packets (more aggressive)
-            for seq_id in timed_out_packets:
-                self._resend_data_packet(seq_id, client_address, "timeout")
-            
-            # Trigger congestion event
-            self.flow_manager.on_loss_detected("timeout")
-            # Apply RTO backoff
-            self.current_rto = min(self.current_rto * 1.15, RTO_MAXIMUM)
-    
-    def _advance_window(self):
-        """Cleans up internal state as the window base moves forward."""
-        while self.window_base in self.confirmed_packets:
-            self.confirmed_packets.remove(self.window_base)
-            
-            # Clear old packet data
-            self.packet_send_times.pop(self.window_base, None)
-            self.packet_payload_cache.pop(self.window_base, None)
-            self.packet_timeout_map.pop(self.window_base, None)
-            
-            self.window_base += MSS
-    
-    def transmit_file_data(self, data_to_send, client_address):
-        """Main transfer loop to send all file data."""
-        file_byte_size = len(data_to_send)
-        print(f"\n[Server] Beginning transfer of {file_byte_size} bytes.")
-        num_packets = (file_byte_size + MSS - 1) // MSS
-        print(f"[Server] Total packets to send: {num_packets}")
+        self.client_addr = None
+        self.file_content = None
+        self.file_size = 0
         
-        transfer_start_time = time.time()
+        # Stats
+        self.total_sent = 0
+        self.total_retrans = 0
+        self.total_fast_retrans = 0
         
-        while self.window_base < file_byte_size:
-            # --- SEND PHASE ---
-            current_cwnd = self.flow_manager.get_current_window()
-            
-            # Send all packets allowed by the current window
-            while self.next_packet_seq < self.window_base + current_cwnd and \
-                  self.next_packet_seq < file_byte_size:
-                
-                if self.next_packet_seq not in self.confirmed_packets:
-                    chunk_end = min(self.next_packet_seq + MSS, file_byte_size)
-                    data_chunk = data_to_send[self.next_packet_seq:chunk_end]
-                    self._send_data_packet(self.next_packet_seq, data_chunk, client_address)
-                
-                self.next_packet_seq += MSS
-            
-            # --- RECEIVE PHASE ---
-            wait_time = self._get_next_timeout_interval()
-            self.listener_socket.settimeout(wait_time)
-            
-            try:
-                ack_data, addr = self.listener_socket.recvfrom(PACKET_LIMIT_BYTES)
-                ack_rcvd_time = time.time()
-                
-                cum_ack, sack_blocks = self._parse_ack(ack_data)
-                if cum_ack is None:
-                    continue # Bad ACK
-                
-                self.total_acks_rcvd += 1
-                
-                # --- Process Cumulative ACK ---
-                if cum_ack > self.window_base:
-                    bytes_acked = cum_ack - self.window_base
-                    rtt_sample = 0
-                    
-                    if self.window_base in self.packet_send_times:
-                        rtt_sample = ack_rcvd_time - self.packet_send_times[self.window_base]
-                        self._calculate_new_rto(rtt_sample)
-                    
-                    self.flow_manager.on_ack_received(bytes_acked, rtt_sample)
-                    
-                    # Mark all packets up to cum_ack as confirmed
-                    seq_ptr = self.window_base
-                    while seq_ptr < cum_ack:
-                        self.confirmed_packets.add(seq_ptr)
-                        seq_ptr += MSS
-                    
-                    self._advance_window()
-                    self.dup_ack_tracker.clear()
-                
-                # --- Process SACK Blocks ---
-                for left, right in sack_blocks:
-                    seq_ptr = left
-                    while seq_ptr < right and seq_ptr < file_byte_size:
-                        if seq_ptr >= self.window_base:
-                            self.confirmed_packets.add(seq_ptr)
-                        seq_ptr += MSS
-                
-                # --- Fast Retransmit Check ---
-                if cum_ack == self.window_base:
-                    self.dup_ack_tracker[cum_ack] = self.dup_ack_tracker.get(cum_ack, 0) + 1
-                    
-                    if self.dup_ack_tracker[cum_ack] == 3:
-                        if self.window_base not in self.confirmed_packets:
-                            self._resend_data_packet(self.window_base, client_address, "fast_retransmit")
-                            self.flow_manager.on_loss_detected("fast_retransmit")
-            
-            except socket.timeout:
-                self._check_for_timeouts(client_address)
-        
-        # --- Finalize Transfer ---
-        elapsed_time = time.time() - transfer_start_time
-        throughput_mbps = (file_byte_size * 8 / elapsed_time / 1_000_000)
-        
-        print(f"[Server] Transfer complete in {elapsed_time:.2f}s ({throughput_mbps:.2f} Mbps)")
-        print(f"[Server] Total Packets: {self.total_packets_sent}, Retransmits: {self.total_retransmits}")
-        
-        # Send FIN marker
-        fin_packet = self._create_packet(file_byte_size, FIN_MARKER)
-        for _ in range(5):
-            self.listener_socket.sendto(fin_packet, client_address)
-            time.sleep(0.04)
-    
-    def start_server(self):
-        """Waits for a client, loads the file, and starts the transfer."""
-        print(f"\n[Server] Waiting for client connection...")
-        self.listener_socket.settimeout(30.0) # Wait 30s for a client
-        
+        print(f"[Server] Ready at {ip}:{port}")
+
+    def wait_for_client(self):
+        """Blocks until a client sends a request."""
+        print("[Server] Waiting for client...")
+        self.sock.settimeout(30.0)
         try:
-            request, client_address = self.listener_socket.recvfrom(PACKET_LIMIT_BYTES)
-            print(f"[Server] Client connected from: {client_address}")
+            req, self.client_addr = self.sock.recvfrom(MAX_PACKET)
+            print(f"[Server] Client connected: {self.client_addr}")
+            self.sock.settimeout(None)
+            return True
         except socket.timeout:
-            print("[Server] ERROR: No client request received. Shutting down.")
-            return
-        
-        self.listener_socket.settimeout(None)
-        
-        # Load the file
-        data_filename = "data.txt"
-        if not os.path.exists(data_filename):
-            print(f"[Server] ERROR: Data file '{data_filename}' not found.")
-            return
-        
-        with open(data_filename, 'rb') as f:
-            file_data = f.read()
-        
-        print(f"[Server] Loaded '{data_filename}': {len(file_data)} bytes")
-        
-        self.transmit_file_data(file_data, client_address)
-        self.listener_socket.close()
+            print("[Server] No client request received.")
+            return False
 
+    def load_file(self, filename="data.txt"):
+        """Loads the file to be sent."""
+        if not os.path.exists(filename):
+            print(f"[Server] ERROR: File '{filename}' not found.")
+            return False
+        
+        with open(filename, 'rb') as f:
+            self.file_content = f.read()
+        self.file_size = len(self.file_content)
+        print(f"[Server] Loaded '{filename}': {self.file_size} bytes")
+        return True
+
+    def _parse_ack(self, packet):
+        """Utility to parse ACK packets."""
+        if len(packet) < 4: return None, []
+        ack_num = struct.unpack('!I', packet[:4])[0]
+        sack_ranges = []
+        if len(packet) >= 20:
+            try:
+                for i in range(2):
+                    offset = 4 + i * 8
+                    if offset + 8 <= len(packet):
+                        left = struct.unpack('!I', packet[offset:offset+4])[0]
+                        right = struct.unpack('!I', packet[offset+4:offset+8])[0]
+                        if left > 0 and right > left:
+                            sack_ranges.append((left, right))
+            except: pass
+        return ack_num, sack_ranges
+
+    def _send_window(self):
+        """Sends all packets permitted by the current CWND."""
+        window_end = self.tracker.base_seq + self.cubic.get_window_size()
+        
+        while self.tracker.next_seq < window_end and \
+              self.tracker.next_seq < self.file_size:
+            
+            seq = self.tracker.next_seq
+            if not self.tracker.is_acked(seq):
+                end_pos = min(seq + MSS, self.file_size)
+                chunk = self.file_content[seq:end_pos]
+                
+                self.tracker.store_packet(seq, chunk, time.time(), self.rto.get_rto())
+                self.sock.sendto(self.tracker.get_packet_data(seq), self.client_addr)
+                self.total_sent += 1
+            
+            self.tracker.next_seq += MSS
+
+    def _handle_ack(self, packet, recv_time):
+        """Processes an incoming ACK packet."""
+        ack_num, sack_blocks = self._parse_ack(packet)
+        if ack_num is None: return
+
+        # --- 1. Process Cumulative ACK ---
+        if ack_num > self.tracker.base_seq:
+            bytes_acked = ack_num - self.tracker.base_seq
+            
+            send_time = self.tracker.get_send_time(self.tracker.base_seq)
+            if send_time:
+                sample_rtt = recv_time - send_time
+                self.rto.update(sample_rtt)
+                self.cubic.on_ack(bytes_acked, sample_rtt)
+            
+            # Mark packets as ACKed and slide window
+            seq = self.tracker.base_seq
+            while seq < ack_num:
+                self.tracker.mark_acked(seq)
+                seq += MSS
+            self.tracker.slide_window()
+            self.tracker.clear_dup_acks()
+
+        # --- 2. Process SACK Blocks ---
+        for left, right in sack_blocks:
+            seq = left
+            while seq < right and seq < self.file_size:
+                if seq >= self.tracker.base_seq:
+                    self.tracker.mark_acked(seq)
+                seq += MSS
+
+        # --- 3. Check for Fast Retransmit ---
+        if ack_num == self.tracker.base_seq:
+            dup_count = self.tracker.count_dup_ack(ack_num)
+            if dup_count == 3 and not self.tracker.is_acked(self.tracker.base_seq):
+                self._retransmit(self.tracker.base_seq, "fast_retransmit")
+                self.cubic.on_loss("fast_retransmit")
+
+    def _retransmit(self, seq_num, reason="timeout"):
+        """Retransmits a single packet."""
+        packet_data = self.tracker.get_packet_data(seq_num)
+        if packet_data:
+            self.sock.sendto(packet_data, self.client_addr)
+            self.tracker.resend_packet(seq_num, time.time(), self.rto.get_rto())
+            self.total_retrans += 1
+            if reason == "fast_retransmit":
+                self.total_fast_retrans += 1
+
+    def _handle_timeout(self):
+        """Handles a socket timeout event."""
+        timed_out = self.tracker.get_timed_out_packets()
+        if not timed_out: return
+            
+        for seq_num in timed_out:
+            self._retransmit(seq_num, "timeout")
+
+        # Only trigger one loss event per timeout
+        self.cubic.on_loss("timeout")
+        self.rto.backoff()
+
+    def start_transfer(self):
+        """Main transfer loop."""
+        if not self.file_content:
+            print("[Server] No file loaded. Aborting.")
+            return
+
+        print(f"[Server] Starting transfer of {self.file_size} bytes...")
+        start_time = time.time()
+        
+        while self.tracker.base_seq < self.file_size:
+            # 1. Send packets
+            self._send_window()
+            
+            # 2. Wait for ACK or Timeout
+            timeout = self.tracker.get_next_timeout(self.rto.get_rto())
+            self.sock.settimeout(timeout)
+            
+            try:
+                ack_packet, addr = self.sock.recvfrom(MAX_PACKET)
+                self._handle_ack(ack_packet, time.time())
+            except socket.timeout:
+                self._handle_timeout()
+        
+        # --- Transfer Complete ---
+        elapsed = time.time() - start_time
+        throughput = (self.file_size * 8 / elapsed / 1_000_000)
+        
+        print(f"[Server] Done: {elapsed:.2f}s, {throughput:.2f} Mbps")
+        print(f"[Server] Sent: {self.total_sent}, Retrans: {self.total_retrans} (Fast: {self.total_fast_retrans})")
+        
+        # Send EOF
+        eof_packet_data = self.tracker._build_packet(self.file_size, EOF_FLAG)
+        for _ in range(5):
+            self.sock.sendto(eof_packet_data, self.client_addr)
+            time.sleep(0.04)
+        
+        self.sock.close()
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: python3 p2_server_refactored.py <SERVER_IP> <SERVER_PORT>")
+        print("Usage: python3 p2_server_refactored.py <IP> <PORT>")
         sys.exit(1)
     
-    server = FastDataTransmitter(sys.argv[1], int(sys.argv[2]))
-    server.start_server()
-
+    server = FileSender(sys.argv[1], int(sys.argv[2]))
+    if server.wait_for_client() and server.load_file():
+        server.start_transfer()
 
 if __name__ == "__main__":
     main()
