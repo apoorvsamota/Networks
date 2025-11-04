@@ -20,7 +20,7 @@ class CustomTopo(Topo):
         s1 = self.addSwitch('s1')
 
         # Add links
-        self.addLink(h1, s1, loss=loss, delay=f'{delay}ms', jitter=f'{jitter}ms')
+        self.addLink(h1, s1, loss=loss, delay=f'{delay}ms', jitter=f'{jitter}ms', bw = 1.6)
 
         # Link between h2 and s1 with no packet loss (client side)
         self.addLink(h2, s1, loss=0)
@@ -68,7 +68,7 @@ def run(expname):
     elif expname == "jitter":
         delay_list = [20]    
         loss_list = [1]     
-        jitter_list = [20, 40, 60, 80, 100]
+        jitter_list = [100]
     else:
         print("Unknown experiment name. Use 'loss' or 'jitter'.")
         f_out.close()
