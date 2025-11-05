@@ -143,10 +143,14 @@ class ReliableUDPClient:
             self.pkts_recv += 1
             self.send_ack(0)  # Still expecting seq=0
         
+        # After processing first packet, try to deliver any buffered data
+        self.deliver_buffered()
+        
         # NO timeout - blocking receive
         self.sock.settimeout(None)
         
         eof_received = False
+        eof_seq = None  # Track EOF sequence number
         
         while not eof_received:
             try:
@@ -159,9 +163,11 @@ class ReliableUDPClient:
                 self.pkts_recv += 1
                 
                 if data == b'EOF':
-                    print(f"[CLIENT] EOF received")
+                    print(f"[CLIENT] EOF received at seq={seq}")
+                    eof_seq = seq
                     eof_received = True
-                    break
+                    # Don't break immediately - continue receiving for a bit to get late packets
+                    continue
                 
                 if seq == self.expected_seq:
                     self.file_data.extend(data)
@@ -189,6 +195,52 @@ class ReliableUDPClient:
             except Exception as e:
                 print(f"[ERROR] {e}")
                 break
+        
+        # After EOF is received, wait a bit more for any late packets
+        if eof_received and eof_seq is not None and self.expected_seq < eof_seq:
+            print(f"[CLIENT] Waiting for remaining packets (expected: {self.expected_seq}, EOF at: {eof_seq})...")
+            self.sock.settimeout(2.0)  # Wait up to 2 seconds for late packets
+            wait_start = time.time()
+            
+            while self.expected_seq < eof_seq and time.time() - wait_start < 3.0:
+                try:
+                    pkt, _ = self.sock.recvfrom(MAX_PAYLOAD + 100)
+                    seq, data = self.parse_pkt(pkt)
+                    
+                    if seq is None or data == b'EOF':
+                        continue
+                    
+                    self.pkts_recv += 1
+                    
+                    if seq == self.expected_seq:
+                        self.file_data.extend(data)
+                        self.expected_seq += len(data)
+                        self.deliver_buffered()
+                        self.send_ack(self.expected_seq)
+                    elif seq > self.expected_seq:
+                        if seq not in self.buffer:
+                            self.buffer[seq] = data
+                            self.ooo_count += 1
+                        self.send_ack(self.expected_seq)
+                    else:
+                        self.dup_count += 1
+                        self.send_ack(self.expected_seq)
+                        
+                    # Check if we're done
+                    if self.expected_seq >= eof_seq:
+                        print(f"[CLIENT] All packets received!")
+                        break
+                        
+                except socket.timeout:
+                    print(f"[CLIENT] Timeout waiting for packets")
+                    break
+                except Exception as e:
+                    print(f"[ERROR] in late packet reception: {e}")
+                    break
+            
+            if self.expected_seq < eof_seq:
+                print(f"[CLIENT] WARNING: Missing data! Expected {self.expected_seq}, EOF at {eof_seq}")
+                print(f"[CLIENT] Missing {eof_seq - self.expected_seq} bytes")
         
         elapsed = time.time() - start
         

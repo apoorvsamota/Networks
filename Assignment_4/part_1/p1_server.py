@@ -200,13 +200,13 @@ class TransferWindow:
                     return i # Return index for fast retransmit
         return -1 # No fast retransmit
 
-    def on_sack(self, start_idx, end_idx):
-        """Marks packets in the SACK range."""
-        for i in range(start_idx, end_idx):
-            if self.packet_seq_nums[i] < end_seq:
-                self.sacked[i] = 1
-                if i in self.timers:
-                    del self.timers[i]
+    # def on_sack(self, start_idx, end_idx):
+    #     """Marks packets in the SACK range."""
+    #     for i in range(start_idx, end_idx):
+    #         if self.packet_seq_nums[i] < end_seq:
+    #             self.sacked[i] = 1
+    #             if i in self.timers:
+    #                 del self.timers[i]
 
 
 class ReliableServer:
