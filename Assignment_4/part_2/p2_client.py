@@ -1,279 +1,255 @@
 #!/usr/bin/env python3
-"""
-Part 2 Client: Modular SACK Receiver (Corrected)
-A structurally re-architected reliable UDP client.
-Packet buffering and SACK generation are isolated into a
-helper class, simplifying the main client's logic.
-"""
-
 import socket
 import sys
 import struct
 import time
 
-# --- Constants ---
-HEADER_LEN = 20
-MAX_PACKET = 1200
-MAX_PAYLOAD = MAX_PACKET - HEADER_LEN
-EOF_FLAG = b"EOF"
+# Configuration constants
+PKT_SIZE = 1200
+HDR_SIZE = 20
+DATA_SIZE = PKT_SIZE - HDR_SIZE
+END_MARKER = b"EOF"
 
-# --- Config ---
-REQUEST_TIMEOUT = 2.0
-MAX_REQUEST_RETRIES = 5
-TRANSFER_TIMEOUT = 8.0
-MAX_CONSECUTIVE_TIMEOUTS = 8
-
-
-#
-# 🔴======= THIS CLASS HAS BEEN FIXED =======🔴
-#
-class PacketBuffer:
-    """Manages buffering, assembly, and SACK generation."""
+class ReceptionBuffer:
+    """Manages out-of-order packet buffering and reassembly"""
     
     def __init__(self):
-        self.expected_seq = 0
-        self.buffer = {}
-        self.data_store = bytearray()
-    
-    def get_expected_seq(self):
-        """Returns the current cumulative ACK point."""
-        return self.expected_seq
-    
-    def get_final_data(self):
-        """Returns the fully assembled data."""
-        return self.data_store
-    
-    def get_buffer_size(self):
-        """Returns the number of out-of-order packets."""
-        return len(self.buffer)
+        self.next_expected = 0
+        self.ooo_storage = {}
+        self.assembled_data = bytearray()
+        self.last_ack = -1
         
-    def add_packet(self, seq_num, data):
-        """
-        Adds a packet to the buffer.
-        Returns (is_new_packet, is_duplicate)
-        """
+    def expected_sequence(self):
+        return self.next_expected
         
-        # --- THIS IS THE CORRECTED LOGIC ---
+    def assembled_bytes(self):
+        return self.assembled_data
         
-        # 1. Check if it's an old, already-processed duplicate
-        if seq_num < self.expected_seq:
-            return False, True # Is duplicate
+    def buffer_depth(self):
+        return len(self.ooo_storage)
         
-        # 2. Check if it's a duplicate of a packet already in the OOO buffer
-        if seq_num in self.buffer:
-            return False, True # Is duplicate
+    def insert_packet(self, seq, payload):
+        """Insert packet and return (is_new, is_duplicate)"""
         
-        # 3. It's a new packet (either in-order or OOO)
-        self.buffer[seq_num] = data
+        # Already processed - duplicate
+        if seq < self.next_expected:
+            return False, True
         
-        # 4. If it's in-order, process the contiguous block
-        if seq_num == self.expected_seq:
+        # Already buffered - duplicate
+        if seq in self.ooo_storage:
+            return False, True
+        
+        # New packet
+        self.ooo_storage[seq] = payload
+        
+        # Assemble if in-order
+        if seq == self.next_expected:
             self._assemble_contiguous()
             
-        return True, False # It's a new packet
+        return True, False
 
     def _assemble_contiguous(self):
-        """Internal: Assembles all in-order packets from the buffer."""
-        while self.expected_seq in self.buffer:
-            data = self.buffer.pop(self.expected_seq)
-            self.data_store.extend(data)
-            self.expected_seq += len(data)
+        """Assemble all contiguous packets"""
+        while self.next_expected in self.ooo_storage:
+            chunk = self.ooo_storage.pop(self.next_expected)
+            self.assembled_data.extend(chunk)
+            self.next_expected += len(chunk)
 
-    def generate_ack_packet(self):
-        """Builds the full ACK packet with SACK blocks."""
-        # 1. Start with cumulative ACK
-        ack_pkt = struct.pack('!I', self.expected_seq)
+    def build_ack_packet(self):
+        """Construct ACK with selective acknowledgments"""
+        # Start with cumulative ACK
+        ack_data = struct.pack('!I', self.next_expected)
         
-        # 2. Generate and add SACK blocks
-        if not self.buffer:
-            return ack_pkt.ljust(HEADER_LEN, b'\x00')
+        # Add SACK blocks
+        if not self.ooo_storage:
+            return ack_data.ljust(HDR_SIZE, b'\x00')
             
-        sorted_seqs = sorted(self.buffer.keys())
-        sack_blocks = []
+        sorted_sequences = sorted(self.ooo_storage.keys())
+        sack_ranges = []
         
-        start = sorted_seqs[0]
-        end = start + len(self.buffer[start])
+        range_start = sorted_sequences[0]
+        range_end = range_start + len(self.ooo_storage[range_start])
         
-        for seq in sorted_seqs[1:]:
-            if seq == end:
-                end = seq + len(self.buffer[seq])
+        for seq in sorted_sequences[1:]:
+            if seq == range_end:
+                range_end = seq + len(self.ooo_storage[seq])
             else:
-                if len(sack_blocks) < 2:
-                    sack_blocks.append((start, end))
-                start = seq
-                end = seq + len(self.buffer[seq])
+                if len(sack_ranges) < 2:
+                    sack_ranges.append((range_start, range_end))
+                range_start = seq
+                range_end = seq + len(self.ooo_storage[seq])
         
-        if len(sack_blocks) < 2:
-            sack_blocks.append((start, end))
+        if len(sack_ranges) < 2:
+            sack_ranges.append((range_start, range_end))
         
-        for left, right in sack_blocks[:2]:
-            ack_pkt += struct.pack('!II', left, right)
+        for start, end in sack_ranges[:2]:
+            ack_data += struct.pack('!II', start, end)
             
-        # 3. Pad to header size
-        return ack_pkt.ljust(HEADER_LEN, b'\x00')
+        return ack_data.ljust(HDR_SIZE, b'\x00')
 
-#
-# 🔴======= END OF FIXED CLASS =======🔴
-#
-
-
-class FileReceiver:
-    """Main client class. Manages the socket and coordinates."""
+class UDPClient:
+    """Main client orchestrator"""
     
-    def __init__(self, server_ip, server_port, prefix):
-        self.server_addr = (server_ip, server_port)
-        self.output_file = f"{prefix}received_data.txt"
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def __init__(self, target_ip, target_port, file_prefix):
+        self.server_addr = (target_ip, target_port)
+        self.output_path = f"{file_prefix}received_data.txt"
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         
-        # The buffer manager is now its own object
-        self.buffer = PacketBuffer()
+        self.rx_buffer = ReceptionBuffer()
         
-        # Stats
-        self.stat_packets = 0
-        self.stat_acks = 0
-        self.stat_ooo = 0
-        self.stat_dups = 0
+        # Statistics
+        self.pkts_received = 0
+        self.acks_transmitted = 0
+        self.ooo_packets = 0
+        self.duplicate_packets = 0
         
-        print(f"[Client] Connecting to {server_ip}:{server_port}")
+        print(f"[CLIENT] Targeting {target_ip}:{target_port}")
 
-    def _send_ack(self):
-        """Constructs and sends an ACK."""
-        ack_packet = self.buffer.generate_ack_packet()
-        self.sock.sendto(ack_packet, self.server_addr)
-        self.stat_acks += 1
+    def _transmit_ack(self):
+        """Send acknowledgment to server"""
+        ack_pkt = self.rx_buffer.build_ack_packet()
+        self.udp_sock.sendto(ack_pkt, self.server_addr)
+        self.acks_transmitted += 1
 
-    def _parse_packet(self, packet):
-        if len(packet) < HEADER_LEN: return None, None
-        seq_num = struct.unpack('!I', packet[:4])[0]
-        data = packet[HEADER_LEN:]
-        return seq_num, data
+    def _extract_packet(self, raw_pkt):
+        if len(raw_pkt) < HDR_SIZE:
+            return None, None
+        seq = struct.unpack('!I', raw_pkt[:4])[0]
+        payload = raw_pkt[HDR_SIZE:]
+        return seq, payload
 
-    def _initial_request(self):
-        """Sends the first request to the server."""
-        for attempt in range(MAX_REQUEST_RETRIES):
-            print(f"[Client] Sending request (Attempt {attempt + 1})...")
-            self.sock.sendto(b'R', self.server_addr)
-            self.sock.settimeout(REQUEST_TIMEOUT)
+    def _request_connection(self):
+        """Initiate connection with retries"""
+        for attempt in range(5):
+            print(f"[CLIENT] Connection attempt {attempt + 1}")
+            self.udp_sock.sendto(b'R', self.server_addr)
+            self.udp_sock.settimeout(2.0)
             
             try:
-                packet, addr = self.sock.recvfrom(MAX_PACKET)
-                print("[Client] Server response received.")
-                return packet
+                pkt, addr = self.udp_sock.recvfrom(PKT_SIZE)
+                print("[CLIENT] Server responded")
+                return pkt
             except socket.timeout:
                 continue
         
-        print("[Client] ERROR: No response from server.")
+        print("[CLIENT] Connection failed")
         return None
 
-    def start(self):
-        """Runs the main client loop."""
-        first_packet = self._initial_request()
-        if not first_packet:
+    def execute(self):
+        """Main reception loop"""
+        initial_pkt = self._request_connection()
+        if not initial_pkt:
             return False
 
-        self.sock.settimeout(TRANSFER_TIMEOUT)
-        start_time = time.time()
-        last_status_time = start_time
+        self.udp_sock.settimeout(5.0)  # Shorter timeout for faster response
+        start_ts = time.time()
+        last_status_ts = start_ts
         
-        packets_to_process = [first_packet]
-        timeouts = 0
+        pending_packets = [initial_pkt]
+        timeout_streak = 0
+        last_ack_time = start_ts
         
         while True:
-            # --- Process Batch ---
-            for packet in packets_to_process:
-                seq_num, data = self._parse_packet(packet)
-                if seq_num is None: continue
+            # Process batch
+            for pkt in pending_packets:
+                seq, payload = self._extract_packet(pkt)
+                if seq is None:
+                    continue
                 
-                self.stat_packets += 1
-                timeouts = 0 # Reset timeout count
+                self.pkts_received += 1
+                timeout_streak = 0
                 
-                # Check for EOF
-                if data == EOF_FLAG:
-                    self._write_to_file()
-                    self._print_stats(time.time() - start_time)
+                # EOF detection
+                if payload == END_MARKER:
+                    self._save_file()
+                    self._display_stats(time.time() - start_ts)
                     return True
                 
-                # Add packet to buffer
-                is_new, is_dup = self.buffer.add_packet(seq_num, data)
+                # Buffer packet
+                is_new, is_dup = self.rx_buffer.insert_packet(seq, payload)
                 
                 if is_new:
-                    self.stat_ooo += 1
+                    self.ooo_packets += 1
                 elif is_dup:
-                    self.stat_dups += 1
+                    self.duplicate_packets += 1
                 
-                # Always send ACK
-                self._send_ack()
+                # Send ACK immediately for every packet (better feedback)
+                self._transmit_ack()
+                last_ack_time = time.time()
                 
-                # Status print
+                # Progress update
                 now = time.time()
-                if now - last_status_time > 1.0:
-                    print(f"[Client] Progress: {len(self.buffer.get_final_data())} bytes, " +
-                          f"Buffered: {self.buffer.get_buffer_size()} packets")
-                    last_status_time = now
+                if now - last_status_ts > 1.0:
+                    print(f"[CLIENT] Received: {len(self.rx_buffer.assembled_bytes())} bytes, "
+                          f"Buffered: {self.rx_buffer.buffer_depth()}")
+                    last_status_ts = now
             
-            # --- Wait for Next Packet ---
-            packets_to_process = []
+            # Wait for next packet
+            pending_packets = []
             try:
-                packet, addr = self.sock.recvfrom(MAX_PACKET)
-                packets_to_process.append(packet)
+                pkt, addr = self.udp_sock.recvfrom(PKT_SIZE)
+                pending_packets.append(pkt)
             except socket.timeout:
-                timeouts += 1
-                print(f"[Client] Timeout {timeouts}/{MAX_CONSECUTIVE_TIMEOUTS}")
-                self._send_ack() # Re-send ACK to prompt server
+                timeout_streak += 1
+                print(f"[CLIENT] Timeout {timeout_streak}/12")
                 
-                if timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-                    print("[Client] Transfer stalled. Saving partial file.")
-                    self._write_to_file()
-                    self._print_stats(time.time() - start_time)
+                # Send periodic ACKs
+                now = time.time()
+                if now - last_ack_time >= 0.05:
+                    self._transmit_ack()
+                    last_ack_time = now
+                
+                if timeout_streak >= 12:
+                    print("[CLIENT] Transfer stalled")
+                    self._save_file()
+                    self._display_stats(time.time() - start_ts)
                     return False
-            except Exception as e:
-                print(f"[Client] Socket ERROR: {e}")
-                return False
 
-    def _write_to_file(self):
-        """Saves the assembled data."""
-        data = self.buffer.get_final_data()
+    def _save_file(self):
+        """Write assembled data to file"""
+        data = self.rx_buffer.assembled_bytes()
         if not data:
-            print("[Client] No data received.")
+            print("[CLIENT] No data to save")
             return
 
-        print(f"[Client] Writing {len(data)} bytes to {self.output_file}")
-        with open(self.output_file, 'wb') as f:
+        print(f"[CLIENT] Saving {len(data)} bytes to {self.output_path}")
+        with open(self.output_path, 'wb') as f:
             f.write(data)
 
-    def _print_stats(self, elapsed):
-        print("\n--- Transfer Stats ---")
-        print(f"Time:       {elapsed:.2f}s")
-        data_len = len(self.buffer.get_final_data())
-        print(f"Bytes Rcvd: {data_len}")
-        if elapsed > 0:
-            thrpt = (data_len * 8 / elapsed / 1_000_000)
-            print(f"Throughput: {thrpt:.2f} Mbps")
-        print(f"Packets:    {self.stat_packets}")
-        print(f"OOO:        {self.stat_ooo}")
-        print(f"Duplicates: {self.stat_dups}")
-        print(f"ACKs Sent:  {self.stat_acks}")
+    def _display_stats(self, duration):
+        print("\n=== Transfer Statistics ===")
+        print(f"Duration:     {duration:.2f}s")
+        data_len = len(self.rx_buffer.assembled_bytes())
+        print(f"Data:         {data_len} bytes")
+        if duration > 0:
+            throughput = (data_len * 8 / duration / 1_000_000)
+            print(f"Throughput:   {throughput:.2f} Mbps")
+        print(f"Packets:      {self.pkts_received}")
+        print(f"Out-of-order: {self.ooo_packets}")
+        print(f"Duplicates:   {self.duplicate_packets}")
+        print(f"ACKs sent:    {self.acks_transmitted}")
 
     def run(self):
         try:
-            success = self.start()
-            if success:
-                print("\n[Client] File received successfully.")
+            result = self.execute()
+            if result:
+                print("\n[CLIENT] Transfer successful")
             else:
-                print("\n[Client] File transfer failed or was incomplete.")
-            return success
+                print("\n[CLIENT] Transfer incomplete")
+            return result
         except KeyboardInterrupt:
-            print("\n[Client] User interrupt. Exiting.")
+            print("\n[CLIENT] Interrupted")
             return False
         finally:
-            self.sock.close()
+            self.udp_sock.close()
 
 def main():
     if len(sys.argv) != 4:
-        print("Usage: python3 p2_client_refactored.py <IP> <PORT> <PREFIX>")
+        print("Usage: python3 p2_client.py <SERVER_IP> <SERVER_PORT> <PREF_FILENAME>")
         sys.exit(1)
     
-    client = FileReceiver(sys.argv[1], int(sys.argv[2]), sys.argv[3])
+    client = UDPClient(sys.argv[1], int(sys.argv[2]), sys.argv[3])
     success = client.run()
     sys.exit(0 if success else 1)
 
