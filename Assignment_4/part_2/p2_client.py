@@ -3,254 +3,374 @@ import socket
 import sys
 import struct
 import time
+from collections import deque
 
-# Configuration constants
-PKT_SIZE = 1200
-HDR_SIZE = 20
-DATA_SIZE = PKT_SIZE - HDR_SIZE
-END_MARKER = b"EOF"
+# Constants
+PACKET_MAX = 1200
+HEADER_BYTES = 20
+PAYLOAD_BYTES = PACKET_MAX - HEADER_BYTES
+TERMINATOR = b"EOF"
 
-class ReceptionBuffer:
-    """Manages out-of-order packet buffering and reassembly"""
+class PacketAssembler:
+    """Handles packet buffering, ordering, and SACK generation"""
     
     def __init__(self):
-        self.next_expected = 0
-        self.ooo_storage = {}
-        self.assembled_data = bytearray()
-        self.last_ack = -1
+        self.sequence_expected = 0
+        self.buffer_pool = {}
+        self.completed_data = bytearray()
+        self.previous_ack = -1
         
-    def expected_sequence(self):
-        return self.next_expected
+        # Statistics
+        self.total_received = 0
+        self.duplicates = 0
+        self.out_of_order = 0
+    
+    def next_sequence(self):
+        """Get next expected sequence number"""
+        return self.sequence_expected
+    
+    def get_completed(self):
+        """Return assembled data"""
+        return self.completed_data
+    
+    def pending_count(self):
+        """Return buffered packet count"""
+        return len(self.buffer_pool)
+    
+    def add_data_packet(self, seq, data):
+        """Add packet to buffer - returns (accepted, duplicate)"""
+        self.total_received += 1
         
-    def assembled_bytes(self):
-        return self.assembled_data
-        
-    def buffer_depth(self):
-        return len(self.ooo_storage)
-        
-    def insert_packet(self, seq, payload):
-        """Insert packet and return (is_new, is_duplicate)"""
-        
-        # Already processed - duplicate
-        if seq < self.next_expected:
+        # Check if already processed
+        if seq < self.sequence_expected:
+            self.duplicates += 1
             return False, True
         
-        # Already buffered - duplicate
-        if seq in self.ooo_storage:
+        # Check if already buffered
+        if seq in self.buffer_pool:
+            self.duplicates += 1
             return False, True
         
         # New packet
-        self.ooo_storage[seq] = payload
+        if seq > self.sequence_expected:
+            self.out_of_order += 1
         
-        # Assemble if in-order
-        if seq == self.next_expected:
-            self._assemble_contiguous()
-            
+        self.buffer_pool[seq] = data
+        
+        # Try to assemble if in order
+        if seq == self.sequence_expected:
+            self._merge_sequential_packets()
+        
         return True, False
-
-    def _assemble_contiguous(self):
-        """Assemble all contiguous packets"""
-        while self.next_expected in self.ooo_storage:
-            chunk = self.ooo_storage.pop(self.next_expected)
-            self.assembled_data.extend(chunk)
-            self.next_expected += len(chunk)
-
-    def build_ack_packet(self):
-        """Construct ACK with selective acknowledgments"""
-        # Start with cumulative ACK
-        ack_data = struct.pack('!I', self.next_expected)
-        
-        # Add SACK blocks
-        if not self.ooo_storage:
-            return ack_data.ljust(HDR_SIZE, b'\x00')
-            
-        sorted_sequences = sorted(self.ooo_storage.keys())
-        sack_ranges = []
-        
-        range_start = sorted_sequences[0]
-        range_end = range_start + len(self.ooo_storage[range_start])
-        
-        for seq in sorted_sequences[1:]:
-            if seq == range_end:
-                range_end = seq + len(self.ooo_storage[seq])
-            else:
-                if len(sack_ranges) < 2:
-                    sack_ranges.append((range_start, range_end))
-                range_start = seq
-                range_end = seq + len(self.ooo_storage[seq])
-        
-        if len(sack_ranges) < 2:
-            sack_ranges.append((range_start, range_end))
-        
-        for start, end in sack_ranges[:2]:
-            ack_data += struct.pack('!II', start, end)
-            
-        return ack_data.ljust(HDR_SIZE, b'\x00')
-
-class UDPClient:
-    """Main client orchestrator"""
     
-    def __init__(self, target_ip, target_port, file_prefix):
-        self.server_addr = (target_ip, target_port)
-        self.output_path = f"{file_prefix}received_data.txt"
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    def _merge_sequential_packets(self):
+        """Merge all consecutive packets into completed data"""
+        while self.sequence_expected in self.buffer_pool:
+            payload = self.buffer_pool.pop(self.sequence_expected)
+            self.completed_data.extend(payload)
+            self.sequence_expected += len(payload)
+    
+    def generate_ack_with_sack(self):
+        """Build ACK packet with SACK information"""
+        # Cumulative ACK
+        ack_bytes = struct.pack('!I', self.sequence_expected)
         
-        self.rx_buffer = ReceptionBuffer()
+        # Generate SACK blocks if out-of-order packets exist
+        if not self.buffer_pool:
+            return ack_bytes + b'\x00' * (HEADER_BYTES - 4)
         
-        # Statistics
-        self.pkts_received = 0
-        self.acks_transmitted = 0
-        self.ooo_packets = 0
-        self.duplicate_packets = 0
+        sack_regions = self._compute_sack_blocks()
         
-        print(f"[CLIENT] Targeting {target_ip}:{target_port}")
+        # Add up to 2 SACK blocks
+        for left, right in sack_regions[:2]:
+            ack_bytes += struct.pack('!II', left, right)
+        
+        # Pad to header size
+        while len(ack_bytes) < HEADER_BYTES:
+            ack_bytes += b'\x00'
+        
+        return ack_bytes
+    
+    def _compute_sack_blocks(self):
+        """Calculate SACK block ranges from buffer"""
+        if not self.buffer_pool:
+            return []
+        
+        sequences = sorted(self.buffer_pool.keys())
+        blocks = []
+        
+        block_start = sequences[0]
+        block_end = block_start + len(self.buffer_pool[block_start])
+        
+        for seq in sequences[1:]:
+            if seq == block_end:
+                # Extend current block
+                block_end = seq + len(self.buffer_pool[seq])
+            else:
+                # Save current block and start new one
+                blocks.append((block_start, block_end))
+                if len(blocks) >= 2:
+                    break
+                block_start = seq
+                block_end = seq + len(self.buffer_pool[seq])
+        
+        # Add last block if space
+        if len(blocks) < 2:
+            blocks.append((block_start, block_end))
+        
+        return blocks
+    
+    def get_stats(self):
+        """Return reception statistics"""
+        return {
+            'total': self.total_received,
+            'duplicates': self.duplicates,
+            'out_of_order': self.out_of_order,
+            'completed_bytes': len(self.completed_data)
+        }
 
-    def _transmit_ack(self):
-        """Send acknowledgment to server"""
-        ack_pkt = self.rx_buffer.build_ack_packet()
-        self.udp_sock.sendto(ack_pkt, self.server_addr)
-        self.acks_transmitted += 1
-
-    def _extract_packet(self, raw_pkt):
-        if len(raw_pkt) < HDR_SIZE:
-            return None, None
-        seq = struct.unpack('!I', raw_pkt[:4])[0]
-        payload = raw_pkt[HDR_SIZE:]
-        return seq, payload
-
-    def _request_connection(self):
-        """Initiate connection with retries"""
-        for attempt in range(5):
-            print(f"[CLIENT] Connection attempt {attempt + 1}")
-            self.udp_sock.sendto(b'R', self.server_addr)
-            self.udp_sock.settimeout(2.0)
+class ConnectionManager:
+    """Manages connection establishment with retry logic"""
+    
+    def __init__(self, sock, server_addr):
+        self.sock = sock
+        self.server = server_addr
+        self.max_attempts = 5
+        self.retry_timeout = 2.0
+    
+    def establish_connection(self):
+        """Attempt connection with retries"""
+        for attempt in range(1, self.max_attempts + 1):
+            print(f"[CLI] Connect attempt {attempt}/{self.max_attempts}")
+            
+            self.sock.sendto(b'R', self.server)
+            self.sock.settimeout(self.retry_timeout)
             
             try:
-                pkt, addr = self.udp_sock.recvfrom(PKT_SIZE)
-                print("[CLIENT] Server responded")
-                return pkt
+                packet, addr = self.sock.recvfrom(PACKET_MAX)
+                print("[CLI] Connection established")
+                return packet
             except socket.timeout:
+                if attempt < self.max_attempts:
+                    print(f"[CLI] Timeout, retrying...")
                 continue
         
-        print("[CLIENT] Connection failed")
+        print("[CLI] Connection failed")
         return None
 
-    def execute(self):
-        """Main reception loop"""
-        initial_pkt = self._request_connection()
-        if not initial_pkt:
-            return False
+class TransferMonitor:
+    """Monitors transfer progress and handles timeouts"""
+    
+    def __init__(self):
+        self.start_time = time.time()
+        self.last_progress_print = self.start_time
+        self.consecutive_timeouts = 0
+        self.max_timeouts = 15
+        self.print_interval = 1.0
+    
+    def reset_timeout_counter(self):
+        """Reset timeout streak"""
+        self.consecutive_timeouts = 0
+    
+    def register_timeout(self):
+        """Record a timeout occurrence"""
+        self.consecutive_timeouts += 1
+        return self.consecutive_timeouts
+    
+    def is_stalled(self):
+        """Check if transfer appears stalled"""
+        return self.consecutive_timeouts >= self.max_timeouts
+    
+    def should_print_progress(self):
+        """Check if progress should be displayed"""
+        now = time.time()
+        if now - self.last_progress_print >= self.print_interval:
+            self.last_progress_print = now
+            return True
+        return False
+    
+    def get_elapsed(self):
+        """Get elapsed time"""
+        return time.time() - self.start_time
 
-        self.udp_sock.settimeout(5.0)  # Shorter timeout for faster response
-        start_ts = time.time()
-        last_status_ts = start_ts
+class ReliableClient:
+    """Reliable UDP client with SACK support"""
+    
+    def __init__(self, server_ip, server_port, output_prefix):
+        self.server_addr = (server_ip, server_port)
+        self.output_file = f"{output_prefix}received_data.txt"
         
-        pending_packets = [initial_pkt]
-        timeout_streak = 0
-        last_ack_time = start_ts
+        # Setup socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        
+        # Components
+        self.assembler = PacketAssembler()
+        self.connector = ConnectionManager(self.sock, self.server_addr)
+        self.monitor = TransferMonitor()
+        
+        # ACK state
+        self.ack_counter = 0
+        self.last_ack_time = time.time()
+        self.ack_frequency = 0.001  # Send ACKs frequently for fairness
+        
+        print(f"[CLI] Target: {server_ip}:{server_port}")
+    
+    def _send_acknowledgment(self):
+        """Send ACK to server"""
+        ack_packet = self.assembler.generate_ack_with_sack()
+        self.sock.sendto(ack_packet, self.server_addr)
+        self.ack_counter += 1
+        self.last_ack_time = time.time()
+    
+    def _extract_sequence_and_data(self, packet):
+        """Parse packet header"""
+        if len(packet) < HEADER_BYTES:
+            return None, None
+        
+        seq = struct.unpack('!I', packet[:4])[0]
+        payload = packet[HEADER_BYTES:]
+        return seq, payload
+    
+    def _process_packet_batch(self, packets):
+        """Process multiple packets efficiently"""
+        eof_detected = False
+        
+        for packet in packets:
+            seq, payload = self._extract_sequence_and_data(packet)
+            
+            if seq is None:
+                continue
+            
+            # Check for EOF
+            if payload == TERMINATOR:
+                eof_detected = True
+                break
+            
+            # Add to assembler
+            accepted, duplicate = self.assembler.add_data_packet(seq, payload)
+            
+            # Always ACK (immediate feedback for fairness)
+            self._send_acknowledgment()
+        
+        return eof_detected
+    
+    def _periodic_ack_check(self):
+        """Send periodic ACK if needed"""
+        now = time.time()
+        if now - self.last_ack_time >= 0.05:
+            self._send_acknowledgment()
+    
+    def _print_progress(self):
+        """Display transfer progress"""
+        stats = self.assembler.get_stats()
+        print(f"[CLI] Progress: {stats['completed_bytes']} bytes, "
+              f"Buffered: {self.assembler.pending_count()}, "
+              f"OOO: {stats['out_of_order']}, Dup: {stats['duplicates']}")
+    
+    def start_reception(self):
+        """Main reception loop"""
+        # Establish connection
+        first_packet = self.connector.establish_connection()
+        if not first_packet:
+            return False
+        
+        # Configure for transfer
+        self.sock.settimeout(4.0)  # Moderate timeout for fairness
+        
+        # Process first packet
+        packet_queue = [first_packet]
         
         while True:
-            # Process batch
-            for pkt in pending_packets:
-                seq, payload = self._extract_packet(pkt)
-                if seq is None:
-                    continue
-                
-                self.pkts_received += 1
-                timeout_streak = 0
-                
-                # EOF detection
-                if payload == END_MARKER:
-                    self._save_file()
-                    self._display_stats(time.time() - start_ts)
-                    return True
-                
-                # Buffer packet
-                is_new, is_dup = self.rx_buffer.insert_packet(seq, payload)
-                
-                if is_new:
-                    self.ooo_packets += 1
-                elif is_dup:
-                    self.duplicate_packets += 1
-                
-                # Send ACK immediately for every packet (better feedback)
-                self._transmit_ack()
-                last_ack_time = time.time()
-                
-                # Progress update
-                now = time.time()
-                if now - last_status_ts > 1.0:
-                    print(f"[CLIENT] Received: {len(self.rx_buffer.assembled_bytes())} bytes, "
-                          f"Buffered: {self.rx_buffer.buffer_depth()}")
-                    last_status_ts = now
+            # Process queued packets
+            if self._process_packet_batch(packet_queue):
+                # EOF received
+                self._finalize_transfer()
+                return True
+            
+            # Reset queue
+            packet_queue = []
+            
+            # Display progress periodically
+            if self.monitor.should_print_progress():
+                self._print_progress()
             
             # Wait for next packet
-            pending_packets = []
             try:
-                pkt, addr = self.udp_sock.recvfrom(PKT_SIZE)
-                pending_packets.append(pkt)
+                packet, addr = self.sock.recvfrom(PACKET_MAX)
+                packet_queue.append(packet)
+                self.monitor.reset_timeout_counter()
+                
             except socket.timeout:
-                timeout_streak += 1
-                print(f"[CLIENT] Timeout {timeout_streak}/12")
+                timeout_count = self.monitor.register_timeout()
+                print(f"[CLI] Timeout {timeout_count}/{self.monitor.max_timeouts}")
                 
-                # Send periodic ACKs
-                now = time.time()
-                if now - last_ack_time >= 0.05:
-                    self._transmit_ack()
-                    last_ack_time = now
+                # Send keep-alive ACK
+                self._periodic_ack_check()
                 
-                if timeout_streak >= 12:
-                    print("[CLIENT] Transfer stalled")
-                    self._save_file()
-                    self._display_stats(time.time() - start_ts)
+                if self.monitor.is_stalled():
+                    print("[CLI] Transfer stalled - saving partial")
+                    self._save_to_file()
+                    self._show_statistics()
                     return False
-
-    def _save_file(self):
-        """Write assembled data to file"""
-        data = self.rx_buffer.assembled_bytes()
+    
+    def _finalize_transfer(self):
+        """Complete transfer successfully"""
+        self._save_to_file()
+        self._show_statistics()
+        print("[CLI] Transfer successful")
+    
+    def _save_to_file(self):
+        """Write data to output file"""
+        data = self.assembler.get_completed()
+        
         if not data:
-            print("[CLIENT] No data to save")
+            print("[CLI] No data to save")
             return
-
-        print(f"[CLIENT] Saving {len(data)} bytes to {self.output_path}")
-        with open(self.output_path, 'wb') as f:
+        
+        print(f"[CLI] Saving {len(data)} bytes -> {self.output_file}")
+        with open(self.output_file, 'wb') as f:
             f.write(data)
-
-    def _display_stats(self, duration):
-        print("\n=== Transfer Statistics ===")
-        print(f"Duration:     {duration:.2f}s")
-        data_len = len(self.rx_buffer.assembled_bytes())
-        print(f"Data:         {data_len} bytes")
-        if duration > 0:
-            throughput = (data_len * 8 / duration / 1_000_000)
+    
+    def _show_statistics(self):
+        """Display transfer statistics"""
+        stats = self.assembler.get_stats()
+        elapsed = self.monitor.get_elapsed()
+        
+        print("\n=== Transfer Complete ===")
+        print(f"Time:         {elapsed:.2f}s")
+        print(f"Data:         {stats['completed_bytes']} bytes")
+        
+        if elapsed > 0:
+            throughput = (stats['completed_bytes'] * 8 / elapsed / 1_000_000)
             print(f"Throughput:   {throughput:.2f} Mbps")
-        print(f"Packets:      {self.pkts_received}")
-        print(f"Out-of-order: {self.ooo_packets}")
-        print(f"Duplicates:   {self.duplicate_packets}")
-        print(f"ACKs sent:    {self.acks_transmitted}")
-
-    def run(self):
+        
+        print(f"Packets:      {stats['total']}")
+        print(f"Out-of-order: {stats['out_of_order']}")
+        print(f"Duplicates:   {stats['duplicates']}")
+        print(f"ACKs sent:    {self.ack_counter}")
+    
+    def execute(self):
+        """Run client"""
         try:
-            result = self.execute()
-            if result:
-                print("\n[CLIENT] Transfer successful")
-            else:
-                print("\n[CLIENT] Transfer incomplete")
-            return result
+            success = self.start_reception()
+            return success
         except KeyboardInterrupt:
-            print("\n[CLIENT] Interrupted")
+            print("\n[CLI] Interrupted by user")
+            return False
+        except Exception as e:
+            print(f"\n[CLI] Error: {e}")
             return False
         finally:
-            self.udp_sock.close()
+            self.sock.close()
 
 def main():
     if len(sys.argv) != 4:
         print("Usage: python3 p2_client.py <SERVER_IP> <SERVER_PORT> <PREF_FILENAME>")
         sys.exit(1)
     
-    client = UDPClient(sys.argv[1], int(sys.argv[2]), sys.argv[3])
-    success = client.run()
+    client = ReliableClient(sys.argv[1], int(sys.argv[2]), sys.argv[3])
+    success = client.execute()
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
