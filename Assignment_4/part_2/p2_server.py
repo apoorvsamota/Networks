@@ -6,473 +6,478 @@ import time
 import os
 from collections import deque
 
-# Configuration
+# Protocol constants
 PACKET_MAX = 1200
 HEADER_BYTES = 20
 PAYLOAD_BYTES = PACKET_MAX - HEADER_BYTES
 TERMINATOR = b"EOF"
 
-# RTO constants
-BASE_RTO = 0.12
-FLOOR_RTO = 0.035
-CEILING_RTO = 0.55
-SMOOTH_FACTOR = 0.125
-VARIANCE_FACTOR = 0.25
+# RTO configuration
+BASE_RTO = 0.1
+FLOOR_RTO = 0.03
+CEILING_RTO = 0.5
+SMOOTH_COEFF = 0.125
+VARIANCE_COEFF = 0.25
 
-class BICEngine:
-    """BIC congestion control engine - fairness optimized"""
+class WindowController:
+    """BIC-based window management with RTT fairness"""
     
     def __init__(self):
-        # Core state
-        self.congestion_window = 3 * PAYLOAD_BYTES  # Start conservative
-        self.threshold = 240 * PAYLOAD_BYTES
-        self.prior_peak = 0
-        self.last_size = 0
-        self.epoch_marker = 0
-        self.increase_target = 1
+        # Window state
+        self.send_window = 2 * PAYLOAD_BYTES
+        self.ss_threshold = 220 * PAYLOAD_BYTES
+        self.peak_before_cut = 0
+        self.prev_win_size = 0
+        self.epoch_ts = 0
+        self.growth_target = 1
         
-        # BIC configuration for fairness
-        self.reduction_factor = 0.72  # Symmetric reduction
-        self.convergence_enabled = True
-        self.baseline_window = 14 * PAYLOAD_BYTES
-        self.jump_limit = 18 * PAYLOAD_BYTES  # Conservative jumps
-        self.smooth_divisor = 20
-        self.search_base = 4
+        # BIC tuning for RTT fairness
+        self.cut_factor = 0.7  # RTT-fair reduction
+        self.fast_converge = True
+        self.min_util_win = 14 * PAYLOAD_BYTES
+        self.max_jump = 16 * PAYLOAD_BYTES  # Conservative
+        self.smooth_param = 20
+        self.binary_divisor = 4
         
-        # State flags
-        self.exponential_phase = True
-        self.delay_ack_factor = 1
+        # Phase tracking
+        self.in_slowstart = True
+        self.ack_weight = 1
         
-        # Fairness tracking
-        self.rtt_history = deque(maxlen=20)
-        self.loss_events = 0
-        
-    def get_send_quota(self):
-        """Returns bytes allowed to send"""
-        return int(self.congestion_window)
+        # RTT fairness tracking
+        self.rtt_samples = deque(maxlen=15)
+        self.min_observed_rtt = float('inf')
+        self.loss_history = deque(maxlen=10)
     
-    def register_rtt(self, rtt_value):
-        """Track RTT for fairness"""
-        if rtt_value > 0:
-            self.rtt_history.append(rtt_value)
+    def window_size(self):
+        return int(self.send_window)
     
-    def update_on_ack(self, acked_amount, rtt_measurement):
-        """Process acknowledgment - main window growth logic"""
-        self.register_rtt(rtt_measurement)
+    def track_rtt_sample(self, rtt_val):
+        """Track RTT for fairness adjustments"""
+        if rtt_val > 0:
+            self.rtt_samples.append(rtt_val)
+            self.min_observed_rtt = min(self.min_observed_rtt, rtt_val)
+    
+    def _compute_rtt_penalty(self):
+        """Calculate RTT-based growth penalty for fairness"""
+        if len(self.rtt_samples) < 3:
+            return 1.0
         
-        if self.exponential_phase:
-            # Slow start with fairness consideration
-            growth = acked_amount
-            if len(self.rtt_history) > 5:
-                avg_rtt = sum(self.rtt_history) / len(self.rtt_history)
-                min_rtt = min(self.rtt_history)
-                if avg_rtt > min_rtt * 1.5:  # Detect congestion early
-                    growth = int(growth * 0.7)
-            self.congestion_window += growth
+        recent_rtt = sum(list(self.rtt_samples)[-3:]) / 3
+        if self.min_observed_rtt == 0:
+            return 1.0
+        
+        rtt_ratio = recent_rtt / self.min_observed_rtt
+        
+        # Penalize if experiencing high RTT (congestion indicator)
+        if rtt_ratio > 1.3:
+            return 0.8
+        elif rtt_ratio > 1.15:
+            return 0.9
+        return 1.0
+    
+    def on_new_ack(self, acked_bytes, rtt_measurement):
+        """Process ACK and update window"""
+        self.track_rtt_sample(rtt_measurement)
+        
+        if self.in_slowstart:
+            # Slow start with RTT awareness
+            growth = acked_bytes
+            penalty = self._compute_rtt_penalty()
+            growth = int(growth * penalty)
+            self.send_window += growth
             
-            if self.congestion_window >= self.threshold:
-                self.exponential_phase = False
-                self.epoch_marker = 0
+            if self.send_window >= self.ss_threshold:
+                self.in_slowstart = False
+                self.epoch_ts = 0
         else:
-            # BIC increase
-            self._apply_binary_increase()
-            increment = acked_amount / max(self.increase_target, 1)
-            self.congestion_window += increment
-            
-        # Conservative cap for fairness
-        self.congestion_window = min(self.congestion_window, 550 * PAYLOAD_BYTES)
-    
-    def _apply_binary_increase(self):
-        """Binary search window adjustment"""
-        current = int(self.congestion_window)
+            # Congestion avoidance with BIC
+            self._bic_increase()
+            increment = acked_bytes / max(self.growth_target, 1)
+            penalty = self._compute_rtt_penalty()
+            increment *= penalty
+            self.send_window += increment
         
-        if self.last_size == current:
+        # Conservative cap for RTT fairness
+        self.send_window = min(self.send_window, 520 * PAYLOAD_BYTES)
+    
+    def _bic_increase(self):
+        """Binary Increase logic"""
+        curr = int(self.send_window)
+        
+        if self.prev_win_size == curr:
             return
         
-        self.last_size = current
+        self.prev_win_size = curr
         
-        if self.epoch_marker == 0:
-            self.epoch_marker = time.time()
+        if self.epoch_ts == 0:
+            self.epoch_ts = time.time()
         
-        # Below threshold - linear
-        if self.congestion_window <= self.baseline_window:
-            self.increase_target = self.congestion_window / PAYLOAD_BYTES
+        # Linear region
+        if self.send_window <= self.min_util_win:
+            self.growth_target = self.send_window / PAYLOAD_BYTES
             return
         
-        # Binary search logic with fairness bounds
-        if self.congestion_window < self.prior_peak:
-            gap = (self.prior_peak - self.congestion_window) / self.search_base
+        # Binary search
+        if self.send_window < self.peak_before_cut:
+            distance = (self.peak_before_cut - self.send_window) / self.binary_divisor
             
-            if gap > self.jump_limit:
-                self.increase_target = self.congestion_window / self.jump_limit
-            elif gap <= PAYLOAD_BYTES:
-                self.increase_target = (self.congestion_window * self.smooth_divisor) / (self.search_base * PAYLOAD_BYTES)
+            if distance > self.max_jump:
+                self.growth_target = self.send_window / self.max_jump
+            elif distance <= PAYLOAD_BYTES:
+                self.growth_target = (self.send_window * self.smooth_param) / (self.binary_divisor * PAYLOAD_BYTES)
             else:
-                self.increase_target = self.congestion_window / gap
+                self.growth_target = self.send_window / distance
         else:
-            # Probing phase - very conservative for fairness
-            probe_range = self.prior_peak + self.search_base * PAYLOAD_BYTES
-            if self.congestion_window < probe_range:
-                self.increase_target = (self.congestion_window * self.smooth_divisor) / (self.search_base * PAYLOAD_BYTES)
-            elif self.congestion_window < self.prior_peak + self.jump_limit * (self.search_base - 1):
-                denominator = max(self.congestion_window - self.prior_peak, 1)
-                self.increase_target = (self.congestion_window * (self.search_base - 1)) / denominator
+            # Probing beyond peak
+            probe_limit = self.peak_before_cut + self.binary_divisor * PAYLOAD_BYTES
+            if self.send_window < probe_limit:
+                self.growth_target = (self.send_window * self.smooth_param) / (self.binary_divisor * PAYLOAD_BYTES)
+            elif self.send_window < self.peak_before_cut + self.max_jump * (self.binary_divisor - 1):
+                denom = max(self.send_window - self.peak_before_cut, 1)
+                self.growth_target = (self.send_window * (self.binary_divisor - 1)) / denom
             else:
-                self.increase_target = self.congestion_window / self.jump_limit
+                self.growth_target = self.send_window / self.max_jump
         
-        # Initial phase handling
-        if self.prior_peak == 0:
-            self.increase_target = min(self.increase_target, 18 * PAYLOAD_BYTES)
+        # Initial conditions
+        if self.peak_before_cut == 0:
+            self.growth_target = min(self.growth_target, 16 * PAYLOAD_BYTES)
         
-        self.increase_target = max(self.increase_target / self.delay_ack_factor, 1)
+        self.growth_target = max(self.growth_target / self.ack_weight, 1)
     
-    def react_to_loss(self, loss_category="timeout"):
-        """Handle packet loss events"""
-        self.epoch_marker = 0
-        self.loss_events += 1
+    def on_congestion_event(self, event_kind="timeout"):
+        """Handle loss events"""
+        self.epoch_ts = 0
+        self.loss_history.append(time.time())
         
-        if loss_category == "fast_recovery":
-            # Fast retransmit case - symmetric for fairness
-            if self.convergence_enabled and self.congestion_window < self.prior_peak:
-                self.prior_peak = self.congestion_window * (1 + self.reduction_factor) / 2
+        if event_kind == "dup_ack":
+            # Fast retransmit - symmetric reduction for RTT fairness
+            if self.fast_converge and self.send_window < self.peak_before_cut:
+                self.peak_before_cut = self.send_window * (1 + self.cut_factor) / 2
             else:
-                self.prior_peak = self.congestion_window
+                self.peak_before_cut = self.send_window
             
-            # Uniform reduction for fairness
-            self.threshold = max(int(self.congestion_window * self.reduction_factor), 2 * PAYLOAD_BYTES)
-            self.congestion_window = self.threshold
-            self.exponential_phase = False
+            # Symmetric reduction
+            self.ss_threshold = max(int(self.send_window * self.cut_factor), 2 * PAYLOAD_BYTES)
+            self.send_window = self.ss_threshold
+            self.in_slowstart = False
         else:
-            # Timeout - moderate reset
-            self.threshold = max(int(self.congestion_window * 0.65), 2 * PAYLOAD_BYTES)
-            self.congestion_window = 3 * PAYLOAD_BYTES
-            self.exponential_phase = True
-            self.prior_peak = 0
+            # Timeout
+            self.ss_threshold = max(int(self.send_window * 0.6), 2 * PAYLOAD_BYTES)
+            self.send_window = 3 * PAYLOAD_BYTES
+            self.in_slowstart = True
+            self.peak_before_cut = 0
 
-class TimeoutCalculator:
-    """RTO estimation with smoothing"""
+class RTTEstimator:
+    """RTT estimation and timeout calculation"""
     
     def __init__(self):
-        self.mean_rtt = None
-        self.deviation = None
-        self.current_rto = BASE_RTO
-        self.samples = deque(maxlen=10)
+        self.smoothed = None
+        self.variance = None
+        self.rto_value = BASE_RTO
+        self.sample_history = deque(maxlen=8)
     
-    def get_timeout(self):
-        return self.current_rto
+    def rto(self):
+        return self.rto_value
     
-    def incorporate_sample(self, sample):
-        """Add RTT sample and recalculate"""
-        self.samples.append(sample)
+    def add_measurement(self, sample):
+        """Process RTT sample"""
+        self.sample_history.append(sample)
         
-        if self.mean_rtt is None:
-            self.mean_rtt = sample
-            self.deviation = sample / 2
+        if self.smoothed is None:
+            self.smoothed = sample
+            self.variance = sample / 2
         else:
-            error = abs(sample - self.mean_rtt)
-            self.deviation = (1 - VARIANCE_FACTOR) * self.deviation + VARIANCE_FACTOR * error
-            self.mean_rtt = (1 - SMOOTH_FACTOR) * self.mean_rtt + SMOOTH_FACTOR * sample
+            diff = abs(sample - self.smoothed)
+            self.variance = (1 - VARIANCE_COEFF) * self.variance + VARIANCE_COEFF * diff
+            self.smoothed = (1 - SMOOTH_COEFF) * self.smoothed + SMOOTH_COEFF * sample
         
-        self.current_rto = self.mean_rtt + 4 * self.deviation
-        self.current_rto = max(FLOOR_RTO, min(self.current_rto, CEILING_RTO))
+        self.rto_value = self.smoothed + 4 * self.variance
+        self.rto_value = max(FLOOR_RTO, min(self.rto_value, CEILING_RTO))
     
-    def increase_timeout(self):
-        """Backoff on timeout"""
-        self.current_rto = min(self.current_rto * 1.18, CEILING_RTO)
+    def backoff(self):
+        """RTO backoff"""
+        self.rto_value = min(self.rto_value * 1.15, CEILING_RTO)
 
-class PacketRegistry:
-    """Manages packet lifecycle and retransmission tracking"""
+class FlightTracker:
+    """Track packets in flight and manage retransmissions"""
     
     def __init__(self):
-        self.base_pointer = 0
-        self.send_pointer = 0
-        self.confirmed = set()
-        self.timestamp_map = {}
-        self.data_cache = {}
-        self.deadline_map = {}
-        self.dup_counter = {}
-        self.inflight_count = 0
+        self.left_edge = 0
+        self.right_edge = 0
+        self.acked = set()
+        self.send_log = {}
+        self.packet_store = {}
+        self.expiry_times = {}
+        self.dup_tracker = {}
     
-    def is_confirmed(self, seq):
-        return seq in self.confirmed
+    def acked_already(self, seq):
+        return seq in self.acked
     
-    def record_transmission(self, seq, payload, send_time, timeout_val):
-        """Log sent packet"""
-        packet = self._build_header(seq) + payload
-        self.timestamp_map[seq] = send_time
-        self.data_cache[seq] = packet
-        self.deadline_map[seq] = send_time + timeout_val
-        self.inflight_count += 1
+    def log_send(self, seq, payload, ts, timeout):
+        """Record packet transmission"""
+        pkt = self._make_packet(seq, payload)
+        self.send_log[seq] = ts
+        self.packet_store[seq] = pkt
+        self.expiry_times[seq] = ts + timeout
     
-    def update_retransmission(self, seq, send_time, timeout_val):
-        """Update packet timing on retransmit"""
-        self.timestamp_map[seq] = send_time
-        self.deadline_map[seq] = send_time + timeout_val
+    def update_send_time(self, seq, ts, timeout):
+        """Update timing for retransmission"""
+        self.send_log[seq] = ts
+        self.expiry_times[seq] = ts + timeout
     
-    def fetch_packet(self, seq):
-        return self.data_cache.get(seq)
+    def get_packet(self, seq):
+        return self.packet_store.get(seq)
     
-    def mark_confirmed(self, seq):
-        """Mark packet as acknowledged"""
-        if seq not in self.confirmed:
-            self.confirmed.add(seq)
-            self.inflight_count = max(0, self.inflight_count - 1)
+    def mark_ack(self, seq):
+        self.acked.add(seq)
     
-    def get_timestamp(self, seq):
-        return self.timestamp_map.get(seq)
+    def send_timestamp(self, seq):
+        return self.send_log.get(seq)
     
-    def shift_base_forward(self):
-        """Advance window base"""
-        while self.base_pointer in self.confirmed:
-            self.confirmed.remove(self.base_pointer)
-            self.timestamp_map.pop(self.base_pointer, None)
-            self.data_cache.pop(self.base_pointer, None)
-            self.deadline_map.pop(self.base_pointer, None)
-            self.base_pointer += PAYLOAD_BYTES
+    def advance_window(self):
+        """Slide window forward"""
+        while self.left_edge in self.acked:
+            self.acked.remove(self.left_edge)
+            self.send_log.pop(self.left_edge, None)
+            self.packet_store.pop(self.left_edge, None)
+            self.expiry_times.pop(self.left_edge, None)
+            self.left_edge += PAYLOAD_BYTES
     
-    def calculate_wait_time(self, default_rto):
-        """Compute socket timeout"""
-        if not self.deadline_map:
-            return 0.015
+    def next_timeout(self, default):
+        """Calculate next socket timeout"""
+        if not self.expiry_times:
+            return 0.01
         now = time.time()
-        earliest = min(self.deadline_map.values())
-        return max(0.003, earliest - now)
+        next_exp = min(self.expiry_times.values())
+        return max(0.002, next_exp - now)
     
-    def identify_expired(self):
-        """Find timed-out packets"""
+    def find_expired(self):
+        """Identify timed out packets"""
         now = time.time()
         expired = []
-        for seq, deadline in list(self.deadline_map.items()):
-            if seq not in self.confirmed and now >= deadline:
+        for seq, exp_time in list(self.expiry_times.items()):
+            if seq not in self.acked and now >= exp_time:
                 expired.append(seq)
-        return sorted(expired)  # Retransmit in order
+        return sorted(expired)
     
-    def increment_dup_count(self, ack_val):
+    def count_duplicate(self, ack_val):
         """Track duplicate ACKs"""
-        self.dup_counter[ack_val] = self.dup_counter.get(ack_val, 0) + 1
-        return self.dup_counter[ack_val]
+        self.dup_tracker[ack_val] = self.dup_tracker.get(ack_val, 0) + 1
+        return self.dup_tracker[ack_val]
     
-    def clear_dup_tracking(self):
-        self.dup_counter.clear()
+    def reset_dup_tracking(self):
+        self.dup_tracker.clear()
     
-    def get_inflight(self):
-        """Return number of unacknowledged packets"""
-        return self.inflight_count
-    
-    def _build_header(self, seq):
-        return struct.pack('!I', seq) + b'\x00' * 16
+    def _make_packet(self, seq, payload):
+        hdr = struct.pack('!I', seq) + b'\x00' * 16
+        return hdr + payload
 
-class ReliableServer:
-    """Reliable UDP server with BIC congestion control"""
+class TransferEngine:
+    """Main transfer orchestration"""
     
-    def __init__(self, host, port):
-        self.bind_addr = (host, port)
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-        self.socket.bind(('0.0.0.0', port))
+    def __init__(self, listen_ip, listen_port):
+        self.addr = (listen_ip, listen_port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        self.sock.bind(('0.0.0.0', listen_port))
         
-        # Components
-        self.bic = BICEngine()
-        self.timeout_calc = TimeoutCalculator()
-        self.registry = PacketRegistry()
+        # Core components
+        self.window_ctrl = WindowController()
+        self.rtt_est = RTTEstimator()
+        self.flight = FlightTracker()
         
         # Transfer state
-        self.client = None
-        self.file_content = None
-        self.content_size = 0
+        self.peer = None
+        self.file_data = None
+        self.data_len = 0
         
         # Metrics
-        self.total_transmissions = 0
-        self.total_retransmits = 0
-        self.fast_retransmits = 0
-        self.ack_count = 0
+        self.pkts_sent = 0
+        self.retransmits = 0
+        self.fast_retx = 0
+        self.acks_recv = 0
         
-        print(f"[SRV] Ready on {host}:{port}")
+        print(f"[SRV] Listening on {listen_ip}:{listen_port}")
     
-    def wait_for_client(self):
-        """Accept client connection"""
-        print("[SRV] Awaiting client...")
-        self.socket.settimeout(30.0)
+    def accept_client(self):
+        """Wait for client"""
+        print("[SRV] Waiting for client...")
+        self.sock.settimeout(30.0)
         try:
-            msg, addr = self.socket.recvfrom(PACKET_MAX)
-            self.client = addr
+            req, addr = self.sock.recvfrom(PACKET_MAX)
+            self.peer = addr
             print(f"[SRV] Client: {addr}")
-            self.socket.settimeout(None)
+            self.sock.settimeout(None)
             return True
         except socket.timeout:
-            print("[SRV] Timeout waiting for client")
+            print("[SRV] No client")
             return False
     
-    def load_file_data(self, filepath="data.txt"):
-        """Load file to transmit"""
-        if not os.path.exists(filepath):
-            print(f"[SRV] Missing: {filepath}")
+    def load_content(self, path="data.txt"):
+        """Load file"""
+        if not os.path.exists(path):
+            print(f"[SRV] Not found: {path}")
             return False
         
-        with open(filepath, 'rb') as f:
-            self.file_content = f.read()
-        self.content_size = len(self.file_content)
-        print(f"[SRV] Loaded {filepath}: {self.content_size} bytes")
+        with open(path, 'rb') as f:
+            self.file_data = f.read()
+        self.data_len = len(self.file_data)
+        print(f"[SRV] Loaded {path}: {self.data_len} bytes")
         return True
     
-    def _parse_acknowledgment(self, packet):
-        """Extract ACK and SACK from packet"""
-        if len(packet) < 4:
+    def _decode_ack_packet(self, pkt):
+        """Parse ACK"""
+        if len(pkt) < 4:
             return None, []
         
-        cumulative = struct.unpack('!I', packet[:4])[0]
-        sack_blocks = []
+        cum_ack = struct.unpack('!I', pkt[:4])[0]
+        sack_list = []
         
-        if len(packet) >= 20:
+        if len(pkt) >= 20:
             try:
                 for i in range(2):
-                    offset = 4 + i * 8
-                    if offset + 8 <= len(packet):
-                        left = struct.unpack('!I', packet[offset:offset+4])[0]
-                        right = struct.unpack('!I', packet[offset+4:offset+8])[0]
-                        if left > 0 and right > left and left >= self.registry.base_pointer:
-                            sack_blocks.append((left, right))
+                    pos = 4 + i * 8
+                    if pos + 8 <= len(pkt):
+                        l = struct.unpack('!I', pkt[pos:pos+4])[0]
+                        r = struct.unpack('!I', pkt[pos+4:pos+8])[0]
+                        if l > 0 and r > l and l >= self.flight.left_edge:
+                            sack_list.append((l, r))
             except:
                 pass
         
-        return cumulative, sack_blocks
+        return cum_ack, sack_list
     
-    def _send_from_window(self):
-        """Transmit packets within congestion window"""
-        quota = self.bic.get_send_quota()
-        window_limit = self.registry.base_pointer + quota
+    def _dispatch_packets(self):
+        """Send packets within window"""
+        quota = self.window_ctrl.window_size()
+        limit = self.flight.left_edge + quota
         
-        while self.registry.send_pointer < window_limit and \
-              self.registry.send_pointer < self.content_size:
+        while self.flight.right_edge < limit and self.flight.right_edge < self.data_len:
+            seq = self.flight.right_edge
             
-            seq = self.registry.send_pointer
-            
-            if not self.registry.is_confirmed(seq):
-                end_pos = min(seq + PAYLOAD_BYTES, self.content_size)
-                chunk = self.file_content[seq:end_pos]
+            if not self.flight.acked_already(seq):
+                end = min(seq + PAYLOAD_BYTES, self.data_len)
+                chunk = self.file_data[seq:end]
                 
-                self.registry.record_transmission(seq, chunk, time.time(), 
-                                                 self.timeout_calc.get_timeout())
-                self.socket.sendto(self.registry.fetch_packet(seq), self.client)
-                self.total_transmissions += 1
+                self.flight.log_send(seq, chunk, time.time(), self.rtt_est.rto())
+                self.sock.sendto(self.flight.get_packet(seq), self.peer)
+                self.pkts_sent += 1
             
-            self.registry.send_pointer += PAYLOAD_BYTES
+            self.flight.right_edge += PAYLOAD_BYTES
     
-    def _handle_received_ack(self, packet, recv_time):
-        """Process incoming ACK"""
-        cumulative, sack_list = self._parse_acknowledgment(packet)
-        if cumulative is None:
+    def _process_incoming_ack(self, pkt, recv_ts):
+        """Handle ACK"""
+        cum_ack, sacks = self._decode_ack_packet(pkt)
+        if cum_ack is None:
             return
         
-        self.ack_count += 1
-        new_data_acked = False
+        self.acks_recv += 1
+        fresh_ack = False
         
-        # Process cumulative ACK
-        if cumulative > self.registry.base_pointer:
-            new_data_acked = True
-            bytes_acknowledged = cumulative - self.registry.base_pointer
+        # Cumulative ACK
+        if cum_ack > self.flight.left_edge:
+            fresh_ack = True
+            bytes_acked = cum_ack - self.flight.left_edge
             
-            # Update RTT and congestion control
-            send_time = self.registry.get_timestamp(self.registry.base_pointer)
-            if send_time:
-                rtt = recv_time - send_time
-                self.timeout_calc.incorporate_sample(rtt)
-                self.bic.update_on_ack(bytes_acknowledged, rtt)
+            # RTT update
+            ts = self.flight.send_timestamp(self.flight.left_edge)
+            if ts:
+                rtt = recv_ts - ts
+                self.rtt_est.add_measurement(rtt)
+                self.window_ctrl.on_new_ack(bytes_acked, rtt)
             
-            # Mark packets as confirmed
-            seq = self.registry.base_pointer
-            while seq < cumulative:
-                self.registry.mark_confirmed(seq)
+            # Mark packets
+            seq = self.flight.left_edge
+            while seq < cum_ack:
+                self.flight.mark_ack(seq)
                 seq += PAYLOAD_BYTES
             
-            self.registry.shift_base_forward()
-            self.registry.clear_dup_tracking()
+            self.flight.advance_window()
+            self.flight.reset_dup_tracking()
         
-        # Process SACK blocks
-        for left, right in sack_list:
+        # SACK processing
+        for left, right in sacks:
             seq = left
-            while seq < right and seq < self.content_size:
-                if seq >= self.registry.base_pointer:
-                    self.registry.mark_confirmed(seq)
+            while seq < right and seq < self.data_len:
+                if seq >= self.flight.left_edge:
+                    self.flight.mark_ack(seq)
                 seq += PAYLOAD_BYTES
         
-        # Check for fast retransmit trigger
-        if cumulative == self.registry.base_pointer and not new_data_acked:
-            dup_count = self.registry.increment_dup_count(cumulative)
-            if dup_count == 3:
-                if not self.registry.is_confirmed(self.registry.base_pointer):
-                    self._retransmit_packet(self.registry.base_pointer, "fast_recovery")
-                    self.bic.react_to_loss("fast_recovery")
+        # Duplicate ACK detection
+        if cum_ack == self.flight.left_edge and not fresh_ack:
+            dup_cnt = self.flight.count_duplicate(cum_ack)
+            if dup_cnt == 3:
+                if not self.flight.acked_already(self.flight.left_edge):
+                    self._resend(self.flight.left_edge, "dup_ack")
+                    self.window_ctrl.on_congestion_event("dup_ack")
     
-    def _retransmit_packet(self, seq, reason="timeout"):
-        """Retransmit single packet"""
-        packet = self.registry.fetch_packet(seq)
-        if packet:
-            self.socket.sendto(packet, self.client)
-            self.registry.update_retransmission(seq, time.time(), 
-                                               self.timeout_calc.get_timeout())
-            self.total_retransmits += 1
-            if reason == "fast_recovery":
-                self.fast_retransmits += 1
+    def _resend(self, seq, reason="timeout"):
+        """Retransmit packet"""
+        pkt = self.flight.get_packet(seq)
+        if pkt:
+            self.sock.sendto(pkt, self.peer)
+            self.flight.update_send_time(seq, time.time(), self.rtt_est.rto())
+            self.retransmits += 1
+            if reason == "dup_ack":
+                self.fast_retx += 1
     
-    def _handle_timeout_event(self):
-        """Process timeout - retransmit expired packets"""
-        expired = self.registry.identify_expired()
+    def _check_expirations(self):
+        """Handle timeouts"""
+        expired = self.flight.find_expired()
         if not expired:
             return
         
-        # Retransmit first expired (conservative approach for fairness)
-        self._retransmit_packet(expired[0], "timeout")
-        self.bic.react_to_loss("timeout")
-        self.timeout_calc.increase_timeout()
+        # Retransmit first expired
+        self._resend(expired[0], "timeout")
+        self.window_ctrl.on_congestion_event("timeout")
+        self.rtt_est.backoff()
     
-    def run_transfer(self):
-        """Main transfer loop"""
-        if not self.file_content:
-            print("[SRV] No data loaded")
+    def execute_transfer(self):
+        """Main loop"""
+        if not self.file_data:
+            print("[SRV] No data")
             return
         
-        print(f"[SRV] Transferring {self.content_size} bytes...")
+        print(f"[SRV] Starting transfer: {self.data_len} bytes")
         start = time.time()
         
-        while self.registry.base_pointer < self.content_size:
+        while self.flight.left_edge < self.data_len:
             # Send phase
-            self._send_from_window()
+            self._dispatch_packets()
             
             # Receive phase
-            timeout_duration = self.registry.calculate_wait_time(self.timeout_calc.get_timeout())
-            self.socket.settimeout(timeout_duration)
+            timeout = self.flight.next_timeout(self.rtt_est.rto())
+            self.sock.settimeout(timeout)
             
             try:
-                ack_packet, addr = self.socket.recvfrom(PACKET_MAX)
-                self._handle_received_ack(ack_packet, time.time())
+                ack_pkt, addr = self.sock.recvfrom(PACKET_MAX)
+                self._process_incoming_ack(ack_pkt, time.time())
             except socket.timeout:
-                self._handle_timeout_event()
+                self._check_expirations()
         
-        # Transfer complete
+        # Complete
         elapsed = time.time() - start
-        throughput = (self.content_size * 8 / elapsed / 1_000_000)
+        tput = (self.data_len * 8 / elapsed / 1_000_000)
         
-        print(f"[SRV] Done: {elapsed:.2f}s @ {throughput:.2f} Mbps")
-        print(f"[SRV] Sent={self.total_transmissions} Retx={self.total_retransmits} "
-              f"FastRetx={self.fast_retransmits} ACKs={self.ack_count}")
+        print(f"[SRV] Complete: {elapsed:.2f}s @ {tput:.2f} Mbps")
+        print(f"[SRV] Sent={self.pkts_sent} Retx={self.retransmits} FastRetx={self.fast_retx} ACKs={self.acks_recv}")
         
-        # Send EOF
-        eof_pkt = self.registry._build_header(self.content_size) + TERMINATOR
+        # EOF
+        eof = self.flight._make_packet(self.data_len, TERMINATOR)
         for _ in range(5):
-            self.socket.sendto(eof_pkt, self.client)
-            time.sleep(0.025)
+            self.sock.sendto(eof, self.peer)
+            time.sleep(0.02)
         
-        self.socket.close()
+        self.sock.close()
 
 def main():
     if len(sys.argv) != 3:
         print("Usage: python3 p2_server.py <IP> <PORT>")
         sys.exit(1)
     
-    server = ReliableServer(sys.argv[1], int(sys.argv[2]))
-    if server.wait_for_client() and server.load_file_data():
-        server.run_transfer()
+    engine = TransferEngine(sys.argv[1], int(sys.argv[2]))
+    if engine.accept_client() and engine.load_content():
+        engine.execute_transfer()
 
 if __name__ == "__main__":
     main()
